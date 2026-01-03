@@ -1,0 +1,38 @@
+@import 'tailwindcss';
+
+@theme {
+  /* iOS system blue */
+  --color-blue-ios: #007aff;
+}
+
+:root {
+  color-scheme: light;
+  --ink: #2f2a24;
+  --paper: #f7f1e6;
+  /* All derived from paper→ink mixing for harmony */
+  --paper-deep: #f2ebe0; /* 3% toward ink */
+  --accent-soft: #d8d0c4; /* 12% toward ink - borders, dividers */
+  --accent: #a89d8e; /* 28% toward ink - interactive elements */
+
+  --popover: var(--paper);
+  --popover-foreground: var(--ink);
+  --border: var(--accent-soft);
+}
+
+body {
+  @apply m-0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family:
+    'Iowan Old Style', 'Palatino Linotype', 'Book Antiqua', Palatino,
+    'Cormorant Garamond', 'Garamond', 'Times New Roman', serif;
+  letter-spacing: 0.01em;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+code {
+  font-family:
+    'SFMono-Regular', 'SF Mono', 'IBM Plex Mono', Menlo, Monaco, Consolas,
+    'Liberation Mono', 'Courier New', monospace;
+}

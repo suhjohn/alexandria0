@@ -1,0 +1,47 @@
+# Environment
+.env*
+
+# Build artifacts
+bin/
+tmp/
+dist/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.o
+*.a
+*.out
+*.app
+*.pid
+
+# Go build/test artifacts
+*.test
+*.coverprofile
+coverage/
+cover.out
+cpu.out
+mem.out
+trace.out
+__debug_bin*
+
+# Test
+coverage.html
+
+# Logs
+*.log
+build-errors.log
+
+# Local tooling
+.air/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
