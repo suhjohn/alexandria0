@@ -31,6 +31,18 @@ func NewBookRepository(pool *pgxpool.Pool) *BookRepository {
 	return &BookRepository{pool: pool}
 }
 
+type BookCursor struct {
+	Rank      float64   `json:"rank"`
+	CreatedAt time.Time `json:"created_at"`
+	ID        uuid.UUID `json:"id"`
+}
+
+type BookSearchResult struct {
+	Books      []Book
+	Total      int
+	NextCursor *BookCursor
+}
+
 func (r *BookRepository) GetAll(ctx context.Context) ([]Book, error) {
 	rows, err := r.pool.Query(ctx, `
 		SELECT id, url, title, authors, thumbnail_url, transformation_data, visibility, owner_user_id, created_at, updated_at
@@ -71,6 +83,261 @@ func (r *BookRepository) GetAll(ctx context.Context) ([]Book, error) {
 	}
 
 	return books, rows.Err()
+}
+
+func (r *BookRepository) SearchPublic(ctx context.Context, query string, limit int, cursor *BookCursor) (*BookSearchResult, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 200 {
+		limit = 200
+	}
+
+	var total int
+	err := r.pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM books
+		WHERE visibility = 'public'
+		  AND (
+				$1 = ''
+				OR title % $1
+				OR immutable_array_to_string(authors, ' ') % $1
+				OR title ILIKE ('%' || $1 || '%')
+				OR immutable_array_to_string(authors, ' ') ILIKE ('%' || $1 || '%')
+			)
+	`, query).Scan(&total)
+	if err != nil {
+		return nil, err
+	}
+
+	cursorRank := 0.0
+	cursorCreatedAt := time.Time{}
+	cursorID := uuid.Nil
+	hasCursor := false
+	if cursor != nil {
+		cursorRank = cursor.Rank
+		cursorCreatedAt = cursor.CreatedAt
+		cursorID = cursor.ID
+		hasCursor = true
+	}
+
+	rows, err := r.pool.Query(ctx, `
+		WITH ranked AS (
+			SELECT
+				id, url, title, authors, thumbnail_url, transformation_data, visibility, owner_user_id, created_at, updated_at,
+				CASE
+					WHEN $1 = '' THEN 0
+					ELSE GREATEST(
+						similarity(title, $1),
+						similarity(immutable_array_to_string(authors, ' '), $1)
+					)
+				END AS rank
+			FROM books
+			WHERE visibility = 'public'
+			  AND (
+					$1 = ''
+					OR title % $1
+					OR immutable_array_to_string(authors, ' ') % $1
+					OR title ILIKE ('%' || $1 || '%')
+					OR immutable_array_to_string(authors, ' ') ILIKE ('%' || $1 || '%')
+				)
+		)
+		SELECT
+			id, url, title, authors, thumbnail_url, transformation_data, visibility, owner_user_id, created_at, updated_at, rank
+		FROM ranked
+		WHERE ($3::bool = false) OR ((rank, created_at, id) < ($4, $5, $6))
+		ORDER BY rank DESC, created_at DESC, id DESC
+		LIMIT $2
+	`, query, limit+1, hasCursor, cursorRank, cursorCreatedAt, cursorID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var books []Book
+	var nextCursor *BookCursor
+	for rows.Next() {
+		var book Book
+		var transformationDataJSON []byte
+		var rank float64
+		err := rows.Scan(
+			&book.ID,
+			&book.URL,
+			&book.Title,
+			&book.Authors,
+			&book.ThumbnailURL,
+			&transformationDataJSON,
+			&book.Visibility,
+			&book.OwnerUserID,
+			&book.CreatedAt,
+			&book.UpdatedAt,
+			&rank,
+		)
+		if err != nil {
+			return nil, err
+		}
+
+		if err := json.Unmarshal(transformationDataJSON, &book.TransformationData); err != nil {
+			book.TransformationData = make(map[string][]string)
+		}
+
+		books = append(books, book)
+		if len(books) == limit {
+			nextCursor = &BookCursor{
+				Rank:      rank,
+				CreatedAt: book.CreatedAt,
+				ID:        book.ID,
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	if len(books) > limit {
+		books = books[:limit]
+	} else {
+		nextCursor = nil
+	}
+
+	if books == nil {
+		books = []Book{}
+	}
+
+	return &BookSearchResult{Books: books, Total: total, NextCursor: nextCursor}, nil
+}
+
+func (r *BookRepository) SearchPersonal(
+	ctx context.Context,
+	userID uuid.UUID,
+	email string,
+	query string,
+	limit int,
+	cursor *BookCursor,
+) (*BookSearchResult, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 200 {
+		limit = 200
+	}
+
+	normalized := NormalizeEmail(email)
+	var total int
+	err := r.pool.QueryRow(ctx, `
+		SELECT COUNT(DISTINCT b.id)
+		FROM books b
+		LEFT JOIN book_shares bs ON bs.book_id = b.id AND bs.email = $2
+		WHERE (b.owner_user_id = $1 OR bs.email IS NOT NULL)
+		  AND (
+				$3 = ''
+				OR b.title % $3
+				OR immutable_array_to_string(b.authors, ' ') % $3
+				OR b.title ILIKE ('%' || $3 || '%')
+				OR immutable_array_to_string(b.authors, ' ') ILIKE ('%' || $3 || '%')
+			)
+	`, userID, normalized, query).Scan(&total)
+	if err != nil {
+		return nil, err
+	}
+
+	cursorRank := 0.0
+	cursorCreatedAt := time.Time{}
+	cursorID := uuid.Nil
+	hasCursor := false
+	if cursor != nil {
+		cursorRank = cursor.Rank
+		cursorCreatedAt = cursor.CreatedAt
+		cursorID = cursor.ID
+		hasCursor = true
+	}
+
+	rows, err := r.pool.Query(ctx, `
+		WITH ranked AS (
+			SELECT
+				b.id, b.url, b.title, b.authors, b.thumbnail_url, b.transformation_data,
+				b.visibility, b.owner_user_id, b.created_at, b.updated_at,
+				CASE
+					WHEN $3 = '' THEN 0
+					ELSE GREATEST(
+						similarity(b.title, $3),
+						similarity(immutable_array_to_string(b.authors, ' '), $3)
+					)
+				END AS rank
+			FROM books b
+			LEFT JOIN book_shares bs ON bs.book_id = b.id AND bs.email = $2
+			WHERE (b.owner_user_id = $1 OR bs.email IS NOT NULL)
+			  AND (
+					$3 = ''
+					OR b.title % $3
+					OR immutable_array_to_string(b.authors, ' ') % $3
+					OR b.title ILIKE ('%' || $3 || '%')
+					OR immutable_array_to_string(b.authors, ' ') ILIKE ('%' || $3 || '%')
+				)
+		)
+		SELECT
+			id, url, title, authors, thumbnail_url, transformation_data, visibility, owner_user_id, created_at, updated_at, rank
+		FROM ranked
+		WHERE ($4::bool = false) OR ((rank, created_at, id) < ($5, $6, $7))
+		ORDER BY rank DESC, created_at DESC, id DESC
+		LIMIT $8
+	`, userID, normalized, query, hasCursor, cursorRank, cursorCreatedAt, cursorID, limit+1)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var books []Book
+	var nextCursor *BookCursor
+	for rows.Next() {
+		var book Book
+		var transformationDataJSON []byte
+		var rank float64
+		err := rows.Scan(
+			&book.ID,
+			&book.URL,
+			&book.Title,
+			&book.Authors,
+			&book.ThumbnailURL,
+			&transformationDataJSON,
+			&book.Visibility,
+			&book.OwnerUserID,
+			&book.CreatedAt,
+			&book.UpdatedAt,
+			&rank,
+		)
+		if err != nil {
+			return nil, err
+		}
+
+		if err := json.Unmarshal(transformationDataJSON, &book.TransformationData); err != nil {
+			book.TransformationData = make(map[string][]string)
+		}
+
+		books = append(books, book)
+		if len(books) == limit {
+			nextCursor = &BookCursor{
+				Rank:      rank,
+				CreatedAt: book.CreatedAt,
+				ID:        book.ID,
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	if len(books) > limit {
+		books = books[:limit]
+	} else {
+		nextCursor = nil
+	}
+
+	if books == nil {
+		books = []Book{}
+	}
+
+	return &BookSearchResult{Books: books, Total: total, NextCursor: nextCursor}, nil
 }
 
 func (r *BookRepository) GetAllPublic(ctx context.Context) ([]Book, error) {

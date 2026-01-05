@@ -30,6 +30,7 @@ import remarkGfm from 'remark-gfm'
 
 import type { ChatConversation, ChatMessage } from '@/lib/chat-db'
 import { getChatDb } from '@/lib/chat-db'
+import type { EpubReaderV2BookMetadata } from '@/components/epubreader_v2/types'
 import { cn } from '@/lib/utils'
 import {
   HoverCard,
@@ -111,6 +112,15 @@ type ChapterSuggestion = {
 type CurrentBookInfo = {
   bookId: string
   bookTitle: string
+  metadata?: EpubReaderV2BookMetadata
+}
+
+type CurrentReaderPage = {
+  href: string
+  spineIndex: number
+  pageIndex: number
+  chapterTotalPages: number
+  text: string
 }
 
 function createId() {
@@ -142,10 +152,84 @@ function bookRefTextValue(attrs: any) {
   return bookRefDisplayLabel(attrs)
 }
 
-function toModelMessages(messages: Array<ChatMessage>): Array<ModelMessage> {
-  return messages
+function stripHtmlLike(text: string): string {
+  return String(text ?? '')
+    .replace(/<[^>]*>/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+function currentBookSystemPrompt(currentBook: CurrentBookInfo | null): string {
+  if (!currentBook) return ''
+
+  const metadata = currentBook.metadata ?? {}
+  const title = String(metadata.title ?? currentBook.bookTitle ?? '').trim()
+  const author = String(metadata.author ?? '').trim()
+  const language = String(metadata.language ?? '').trim()
+  const publisher = String(metadata.publisher ?? '').trim()
+  const date = String(metadata.date ?? '').trim()
+  const identifier = String(metadata.identifier ?? '').trim()
+  const modified = String(metadata.modified ?? '').trim()
+  const subjects = Array.isArray(metadata.subjects) ? metadata.subjects : []
+  const descriptionRaw = String(metadata.description ?? '').trim()
+  const description = stripHtmlLike(descriptionRaw)
+
+  const lines: string[] = [
+    'You are a reading assistant embedded in an EPUB reader.',
+    'Use the current book metadata as context. Do not invent missing details.',
+    '',
+    'Current book metadata:',
+    title ? `Title: ${truncateSnippet(title, 160)}` : undefined,
+    author ? `Author: ${truncateSnippet(author, 120)}` : undefined,
+    language ? `Language: ${truncateSnippet(language, 60)}` : undefined,
+    publisher ? `Publisher: ${truncateSnippet(publisher, 120)}` : undefined,
+    date ? `Date: ${truncateSnippet(date, 40)}` : undefined,
+    subjects.length
+      ? `Subjects: ${truncateSnippet(subjects.slice(0, 12).join(', '), 240)}`
+      : undefined,
+    identifier ? `Identifier: ${truncateSnippet(identifier, 120)}` : undefined,
+    modified ? `Modified: ${truncateSnippet(modified, 40)}` : undefined,
+    description
+      ? `Description: ${truncateSnippet(description, 600)}`
+      : undefined,
+  ].filter(Boolean) as string[]
+
+  return lines.join('\n').trim()
+}
+
+function currentVisiblePageSystemPrompt(page: CurrentReaderPage | null): string {
+  if (!page) return ''
+  const href = String(page.href ?? '').trim()
+  const text = String(page.text ?? '').trim()
+  if (!href && !text) return ''
+
+  const pageLabel =
+    page.chapterTotalPages > 1
+      ? `Page: ${page.pageIndex + 1}/${page.chapterTotalPages}`
+      : `Page: ${page.pageIndex + 1}`
+
+  const lines: string[] = [
+    'Currently visible page (may be partial):',
+    href ? `Href: ${truncateSnippet(href, 180)}` : undefined,
+    `SpineIndex: ${page.spineIndex}`,
+    pageLabel,
+    text ? `Text:\n${truncateSnippet(text, 2200)}` : undefined,
+  ].filter(Boolean) as string[]
+
+  return lines.join('\n').trim()
+}
+
+function toModelMessages(
+  messages: Array<ChatMessage>,
+  systemPrompt?: string | null,
+): Array<ModelMessage> {
+  const prompt = String(systemPrompt ?? '').trim()
+  const base = messages
     .filter((m) => m.role === 'user' || m.role === 'assistant')
     .map((m) => ({ role: m.role, content: m.content }))
+
+  if (!prompt) return base
+  return [{ role: 'system', content: prompt }, ...base]
 }
 
 function formatRelativeDate(timestampMs: number) {
@@ -818,6 +902,7 @@ export function ChatSidePanel(
     onNavigateBookRef?: (payload: BookRefNavigatePayload) => void
     chapterSuggestions?: Array<ChapterSuggestion>
     currentBook?: CurrentBookInfo | null
+    getCurrentReaderPage?: () => CurrentReaderPage | null
   } = {},
 ) {
   const isMac = React.useMemo(() => isMacPlatform(), [])
@@ -863,6 +948,7 @@ export function ChatSidePanel(
 
   const abortRef = React.useRef<AbortController | null>(null)
   const scrollRef = React.useRef<HTMLDivElement | null>(null)
+  const scrollPinnedRef = React.useRef(true)
   const cancelledRef = React.useRef(false)
   const editingComposerRef = React.useRef<HTMLDivElement | null>(null)
 
@@ -870,6 +956,36 @@ export function ChatSidePanel(
     () => conversations.find((c) => c.id === selectedConversationId) ?? null,
     [conversations, selectedConversationId],
   )
+
+  const buildSystemPrompt = () => {
+    const pagePrompt = currentVisiblePageSystemPrompt(
+      props.getCurrentReaderPage?.() ?? null,
+    )
+    return [currentBookSystemPrompt(props.currentBook ?? null), pagePrompt]
+      .filter(Boolean)
+      .join('\n\n')
+  }
+
+  const setScrollPinned = React.useCallback((next: boolean) => {
+    if (scrollPinnedRef.current === next) return
+    scrollPinnedRef.current = next
+  }, [])
+
+  const scrollToBottom = React.useCallback((behavior: ScrollBehavior) => {
+    const el = scrollRef.current
+    if (!el) return
+    el.scrollTo({ top: el.scrollHeight, behavior })
+  }, [])
+
+  const handleScroll = React.useCallback(() => {
+    const el = scrollRef.current
+    if (!el) return
+
+    const thresholdPx = 64
+    const atBottom =
+      el.scrollTop + el.clientHeight >= el.scrollHeight - thresholdPx
+    setScrollPinned(atBottom)
+  }, [setScrollPinned])
 
   const parentKey = (parentId: string | null | undefined) =>
     parentId ?? '__root__'
@@ -1076,11 +1192,17 @@ export function ChatSidePanel(
     }
   }, [])
 
+  const lastMessageKey = React.useMemo(() => {
+    const last = messages[messages.length - 1]
+    if (!last) return ''
+    return `${last.id}:${String(last.content ?? '').length}`
+  }, [messages])
+
   React.useEffect(() => {
-    const el = scrollRef.current
-    if (!el) return
-    el.scrollTop = el.scrollHeight
-  }, [messages.length, isStreaming])
+    if (!scrollPinnedRef.current) return
+    // Keep the latest generated text in view while streaming.
+    scrollToBottom('auto')
+  }, [lastMessageKey, isStreaming, scrollToBottom])
 
   React.useEffect(() => {
     if (!editingMessageId) return
@@ -1162,6 +1284,7 @@ export function ChatSidePanel(
     options?: { carriedDraft?: { text: string; doc: TiptapDoc } | null },
   ) => {
     const carriedDraft = options?.carriedDraft ?? null
+    setScrollPinned(true)
     setSelectedConversationId(conversationId)
     setError(null)
     setTab('chat')
@@ -1181,6 +1304,7 @@ export function ChatSidePanel(
 
   const createConversation = () => {
     setError(null)
+    setScrollPinned(true)
     setSelectedConversationId(null)
     setMessages([])
     setThreadHeads([])
@@ -1217,6 +1341,7 @@ export function ChatSidePanel(
       setConversations(next)
       setSelectedConversationId(nextSelected)
       if (nextSelected) {
+        setScrollPinned(true)
         db.setSelectedConversationId(nextSelected)
         await refreshConversationState(nextSelected)
       } else {
@@ -1322,6 +1447,8 @@ export function ChatSidePanel(
     cancelEditMessage()
     setMessages([...baseMessages, newUserMessage, assistantPlaceholder])
     setActiveHeadId(assistantMessageId)
+    setScrollPinned(true)
+    scrollToBottom('auto')
 
     let assistantText = ''
     let wasAborted = false
@@ -1332,7 +1459,11 @@ export function ChatSidePanel(
       db.setActiveMessageId(conversationId, newUserMessage.id)
 
       const provider = createGoogleGenerativeAI({ apiKey: storedKey })
-      const promptMessages = toModelMessages([...baseMessages, newUserMessage])
+      const systemPrompt = buildSystemPrompt()
+      const promptMessages = toModelMessages(
+        [...baseMessages, newUserMessage],
+        systemPrompt,
+      )
 
       setIsStreaming(true)
 
@@ -1433,6 +1564,8 @@ export function ChatSidePanel(
     setEditingMessageId(null)
     setMessages([...baseMessages, assistantPlaceholder])
     setActiveHeadId(newAssistantId)
+    setScrollPinned(true)
+    scrollToBottom('auto')
 
     let assistantText = ''
     let wasAborted = false
@@ -1440,7 +1573,8 @@ export function ChatSidePanel(
     try {
       const db = await getChatDb()
       const provider = createGoogleGenerativeAI({ apiKey: storedKey })
-      const promptMessages = toModelMessages(baseMessages)
+      const systemPrompt = buildSystemPrompt()
+      const promptMessages = toModelMessages(baseMessages, systemPrompt)
 
       setIsStreaming(true)
 
@@ -1603,6 +1737,7 @@ export function ChatSidePanel(
     setDraftText('')
     setDraftDoc(emptyTiptapDoc())
 
+    setScrollPinned(true)
     abortRef.current?.abort()
     const abortController = new AbortController()
     abortRef.current = abortController
@@ -1634,6 +1769,7 @@ export function ChatSidePanel(
 
     setMessages([...baseMessages, userMessage, assistantPlaceholder])
     setActiveHeadId(assistantMessageId)
+    scrollToBottom('auto')
 
     let assistantText = ''
     let wasAborted = false
@@ -1646,7 +1782,11 @@ export function ChatSidePanel(
       db.setActiveMessageId(conversationId, userMessage.id)
 
       const provider = createGoogleGenerativeAI({ apiKey: storedKey })
-      const promptMessages = toModelMessages([...baseMessages, userMessage])
+      const systemPrompt = buildSystemPrompt()
+      const promptMessages = toModelMessages(
+        [...baseMessages, userMessage],
+        systemPrompt,
+      )
 
       setIsStreaming(true)
 
@@ -1768,18 +1908,17 @@ export function ChatSidePanel(
                   </div>
                 </TooltipContent>
               </Tooltip>
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setTab(tab === 'history' ? 'chat' : 'history')
-                      props.onToggleHistory?.()
-                    }}
-                    className={cn(
-                      'cursor-pointer p-1.5 rounded-lg transition-colors',
-                      tab === 'history'
-                        ? 'bg-[color:var(--paper-deep)]'
+	              <Tooltip>
+	                <TooltipTrigger asChild>
+	                  <button
+	                    type="button"
+	                    onClick={() => {
+	                      setTab((prev) => (prev === 'history' ? 'chat' : 'history'))
+	                    }}
+	                    className={cn(
+	                      'cursor-pointer p-1.5 rounded-lg transition-colors',
+	                      tab === 'history'
+	                        ? 'bg-[color:var(--paper-deep)]'
                         : 'hover:bg-[color:var(--paper-deep)]',
                     )}
                     aria-pressed={tab === 'history'}
@@ -1857,8 +1996,12 @@ export function ChatSidePanel(
           </div>
         </div>
       ) : (
-        <div className="flex-1 h-full overflow-y-auto flex flex-col bg-[color:var(--paper-deep)]">
-          <div ref={scrollRef} className="flex-1 px-3 py-3">
+        <div
+          ref={scrollRef}
+          onScroll={handleScroll}
+          className="flex-1 h-full overflow-y-auto flex flex-col bg-[color:var(--paper-deep)]"
+        >
+          <div className="flex-1 px-3 py-3">
             {messages.length === 0 ? (
               <div className="h-full flex items-center justify-center">
                 <div className="text-center">

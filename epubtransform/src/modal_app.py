@@ -51,9 +51,9 @@ def _r2_bucket() -> str:
 
 
 def _derive_dest_key(source_key: str) -> str:
-    if source_key.endswith(".epub"):
-        return source_key[: -len(".epub")] + ".transformed.epub"
-    return source_key + ".transformed.epub"
+    if source_key.lower().endswith(".epub"):
+        return source_key[: -len(".epub")] + "_modernify.epub"
+    return source_key + "_modernify.epub"
 
 
 class TransformRequest(BaseModel):

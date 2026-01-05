@@ -46,3 +46,13 @@ Healtcheck API
 GET /books
 
 Retrieve all the books rows
+
+GET /books/search?q=<query>&limit=<n>&cursor=<opaque>&scope=<public|personal>
+
+Paginated trigram search over `title` and `authors`.
+Returns `{ items: Book[], total: number, limit: number, next_cursor?: string }`.
+`scope=personal` requires auth and returns owned/shared books.
+
+GET /books/{id}
+
+Fetch a single book by id (respects visibility/access rules).

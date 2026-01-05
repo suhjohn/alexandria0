@@ -12,6 +12,7 @@ import (
 type TransformJob struct {
 	ID        uuid.UUID
 	BookID    uuid.UUID
+	Variant   string
 	DestKey   string
 	Status    string
 	LastError string
@@ -30,23 +31,25 @@ func NewTransformJobRepository(pool *pgxpool.Pool) *TransformJobRepository {
 func (r *TransformJobRepository) Upsert(
 	ctx context.Context,
 	bookID uuid.UUID,
+	variant string,
 	destKey string,
 	status string,
 	lastError string,
 ) (*TransformJob, error) {
 	var job TransformJob
 	err := r.pool.QueryRow(ctx, `
-		INSERT INTO transform_jobs (book_id, dest_key, status, last_error)
-		VALUES ($1, $2, $3, $4)
-		ON CONFLICT (book_id)
+		INSERT INTO transform_jobs (book_id, variant, dest_key, status, last_error)
+		VALUES ($1, $2, $3, $4, $5)
+		ON CONFLICT (book_id, variant)
 		DO UPDATE SET dest_key = EXCLUDED.dest_key,
 			status = EXCLUDED.status,
 			last_error = EXCLUDED.last_error,
 			updated_at = NOW()
-		RETURNING id, book_id, dest_key, status, last_error, created_at, updated_at
-	`, bookID, destKey, status, lastError).Scan(
+		RETURNING id, book_id, variant, dest_key, status, last_error, created_at, updated_at
+	`, bookID, variant, destKey, status, lastError).Scan(
 		&job.ID,
 		&job.BookID,
+		&job.Variant,
 		&job.DestKey,
 		&job.Status,
 		&job.LastError,
@@ -59,15 +62,20 @@ func (r *TransformJobRepository) Upsert(
 	return &job, nil
 }
 
-func (r *TransformJobRepository) GetByBookID(ctx context.Context, bookID uuid.UUID) (*TransformJob, error) {
+func (r *TransformJobRepository) GetByBookVariant(
+	ctx context.Context,
+	bookID uuid.UUID,
+	variant string,
+) (*TransformJob, error) {
 	var job TransformJob
 	err := r.pool.QueryRow(ctx, `
-		SELECT id, book_id, dest_key, status, last_error, created_at, updated_at
+		SELECT id, book_id, variant, dest_key, status, last_error, created_at, updated_at
 		FROM transform_jobs
-		WHERE book_id = $1
-	`, bookID).Scan(
+		WHERE book_id = $1 AND variant = $2
+	`, bookID, variant).Scan(
 		&job.ID,
 		&job.BookID,
+		&job.Variant,
 		&job.DestKey,
 		&job.Status,
 		&job.LastError,
@@ -93,7 +101,7 @@ func (r *TransformJobRepository) ListByStatus(
 	}
 
 	rows, err := r.pool.Query(ctx, `
-		SELECT id, book_id, dest_key, status, last_error, created_at, updated_at
+		SELECT id, book_id, variant, dest_key, status, last_error, created_at, updated_at
 		FROM transform_jobs
 		WHERE status = ANY($1)
 		ORDER BY updated_at ASC
@@ -110,6 +118,7 @@ func (r *TransformJobRepository) ListByStatus(
 		if err := rows.Scan(
 			&job.ID,
 			&job.BookID,
+			&job.Variant,
 			&job.DestKey,
 			&job.Status,
 			&job.LastError,

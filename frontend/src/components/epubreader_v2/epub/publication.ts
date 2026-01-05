@@ -22,6 +22,14 @@ function firstTextByLocalName(
   return text || undefined
 }
 
+function allTextByLocalName(doc: XMLDocument, localName: string): string[] {
+  const els = Array.from(doc.getElementsByTagNameNS('*', localName))
+  const values = els
+    .map((el) => el.textContent?.trim() ?? '')
+    .filter(Boolean)
+  return Array.from(new Set(values))
+}
+
 function getMetaProperty(
   doc: XMLDocument,
   property: string,
@@ -67,6 +75,11 @@ function parseOpf(xml: string, opfPath: string) {
   const title = firstTextByLocalName(doc, 'title')
   const language = firstTextByLocalName(doc, 'language')
   const author = firstTextByLocalName(doc, 'creator')
+  const publisher = firstTextByLocalName(doc, 'publisher')
+  const description = firstTextByLocalName(doc, 'description')
+  const subjects = allTextByLocalName(doc, 'subject')
+  const date = firstTextByLocalName(doc, 'date')
+  const modified = getMetaProperty(doc, 'dcterms:modified')
 
   const manifestById = new Map<
     string,
@@ -151,6 +164,11 @@ function parseOpf(xml: string, opfPath: string) {
     title,
     language,
     author,
+    publisher,
+    description,
+    subjects,
+    date,
+    modified,
     rendition,
     spine,
     manifestById,
@@ -302,6 +320,12 @@ export async function loadEpubPublication(
       title: opf.title,
       language: opf.language,
       author: opf.author,
+      publisher: opf.publisher,
+      description: opf.description,
+      subjects: opf.subjects,
+      date: opf.date,
+      identifier: opf.uniqueIdentifier,
+      modified: opf.modified,
       rendition: opf.rendition,
       spine: opf.spine,
       toc,

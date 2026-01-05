@@ -165,6 +165,8 @@ func runServe(cmd *cobra.Command, args []string) error {
 		w.Write([]byte("OK"))
 	})
 	r.Get("/books", booksHandler.GetAll)
+	r.Get("/books/search", booksHandler.Search)
+	r.Get("/books/{id}", booksHandler.GetByID)
 	r.Post("/books/{id}/transform", transformHandler.StartTransform)
 	r.Get("/books/{id}/transform", transformHandler.GetTransform)
 	r.Post("/auth/request", authHandler.RequestMagicLink)

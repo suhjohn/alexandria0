@@ -225,7 +225,6 @@ export function useKeybindings(
     }
 
     const syncTargets = () => {
-      console.log('syncTargets')
       const targets = getTargets()
       for (const w of attached) {
         if (!targets.has(w)) {
@@ -255,15 +254,26 @@ export function useKeybindings(
 
     const onFocusIn = includeIframes ? () => syncTargets() : null
     const onPointerDown = includeIframes ? () => syncTargets() : null
+    const onLoadCapture = includeIframes
+      ? (event: Event) => {
+          // Iframe `load` doesn't bubble, but it can be captured at the document.
+          // Needed because iframe `contentDocument` gets replaced on navigations
+          // (including `srcDoc` updates), and MutationObserver won't see it.
+          if (event.target instanceof HTMLIFrameElement) syncTargets()
+        }
+      : null
     if (onFocusIn) document.addEventListener('focusin', onFocusIn, true)
     if (onPointerDown)
       document.addEventListener('pointerdown', onPointerDown, true)
+    if (onLoadCapture) document.addEventListener('load', onLoadCapture, true)
 
     return () => {
       observer?.disconnect()
       if (onFocusIn) document.removeEventListener('focusin', onFocusIn, true)
       if (onPointerDown)
         document.removeEventListener('pointerdown', onPointerDown, true)
+      if (onLoadCapture)
+        document.removeEventListener('load', onLoadCapture, true)
       for (const w of attached) {
         ;(w as any).removeEventListener('keydown', handler, true)
       }

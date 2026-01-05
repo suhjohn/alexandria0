@@ -36,3 +36,18 @@ code {
     'SFMono-Regular', 'SF Mono', 'IBM Plex Mono', Menlo, Monaco, Consolas,
     'Liberation Mono', 'Courier New', monospace;
 }
+
+/* Hide native search clear button (we use custom X buttons) */
+input[type='search']::-webkit-search-cancel-button,
+input[type='search']::-webkit-search-decoration {
+  -webkit-appearance: none;
+  appearance: none;
+}
+
+button {
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: not-allowed;
+}

@@ -11,13 +11,17 @@ import {
   PanelLeftOpen,
   PanelRight,
   PanelRightOpen,
+  Search,
   Settings,
+  X,
 } from 'lucide-react'
 import { IoLibraryOutline } from 'react-icons/io5'
 
-import { useEffect, useMemo, useState } from 'react'
-import type { Book } from '@/data/books'
-import type { EpubReaderV2Status } from '@/components/epubreader_v2'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useVirtualizer } from '@tanstack/react-virtual'
+import { getBook, searchBooks, type Book } from '@/data/books'
+import type { EpubReaderV2Handle, EpubReaderV2Status } from '@/components/epubreader_v2'
+import type { EpubReaderV2BookMetadata } from '@/components/epubreader_v2/types'
 import type { EpubReaderV2ThemePreset } from '@/components/epubreader_v2/types'
 import { THEME_PRESETS } from '@/components/epubreader_v2/types'
 import { getMe, logout } from '@/data/auth'
@@ -49,6 +53,7 @@ import {
 } from '@/lib/reader-settings'
 import { getCookieValue, safeDecodeCookieValue } from '@/lib/cookies'
 import { useKeybindings } from '@/hooks/use-keybindings'
+import { useInfiniteCursorQuery } from '@/hooks/use-infinite-cursor-query'
 
 const LIBRARY_PANEL_WIDTH_COOKIE = 'library-panel-width'
 const LIBRARY_PANEL_VISIBLE_COOKIE = 'library-panel-visible'
@@ -139,7 +144,6 @@ function App() {
     initialChatWidth,
     initialChatVisible,
   } = Route.useLoaderData()
-  const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:8080'
   const queryClient = useQueryClient()
   const isMac = useMemo(() => {
     if (typeof navigator === 'undefined') return false
@@ -218,20 +222,36 @@ function App() {
     },
   })
 
-  const { data, isLoading, error } = useQuery<Array<Book>>({
-    queryKey: ['books'],
-    queryFn: async () => {
-      const response = await fetch(`${apiUrl}/books`, {
-        credentials: 'include',
-      })
-      if (!response.ok) {
-        throw new Error('Failed to fetch books')
-      }
-      return response.json()
-    },
+  const [libraryScope, setLibraryScope] = useState<'public' | 'personal'>(
+    'public',
+  )
+  const [leftPanelView, setLeftPanelView] = useState<'library' | 'books'>(
+    'books',
+  )
+  const [libraryQuery, setLibraryQuery] = useState('')
+  const libraryLimit = 50
+  const booksQuery = useInfiniteCursorQuery<Book>({
+    queryKey: ['books', 'search', libraryScope, libraryQuery],
+    limit: libraryLimit,
+    enabled: libraryScope === 'public' || Boolean(me),
+    queryFn: ({ cursor, limit }) =>
+      searchBooks({ query: libraryQuery, cursor, limit, scope: libraryScope }),
   })
+  const fetchNextBooksPage = booksQuery.fetchNextPage
+  const hasNextBooksPage = booksQuery.hasNextPage
+  const isFetchingNextBooksPage = booksQuery.isFetchingNextPage
 
-  const books = data || []
+  const books = booksQuery.items
+  const listScrollRef = useRef<HTMLDivElement | null>(null)
+  const listCount = books.length
+  const showLoadMoreRow = hasNextBooksPage
+  const loadMoreInFlightRef = useRef(false)
+  const rowVirtualizer = useVirtualizer({
+    count: showLoadMoreRow ? listCount + 1 : listCount,
+    getScrollElement: () => listScrollRef.current,
+    estimateSize: () => 24,
+    overscan: 10,
+  })
   const [selectedBookId, setSelectedBookId] = useState<string | null>(() => {
     if (initialSelectedBookId) {
       return initialSelectedBookId
@@ -244,7 +264,12 @@ function App() {
     const selectedRaw = getCookieValue(document.cookie, SELECTED_BOOK_COOKIE)
     return selectedRaw ? safeDecodeCookieValue(selectedRaw) : null
   })
-  const selectedBook = books.find((book) => book.id === selectedBookId) || null
+  const { data: selectedBook, isLoading: selectedBookLoading } =
+    useQuery<Book | null>({
+      queryKey: ['book', selectedBookId],
+      enabled: Boolean(selectedBookId),
+      queryFn: async () => (selectedBookId ? getBook(selectedBookId) : null),
+    })
   const [readerStatus, setReaderStatus] = useState<EpubReaderV2Status>('idle')
 
   const [isPanelVisible, setIsPanelVisible] = useState<boolean>(() => {
@@ -292,6 +317,7 @@ function App() {
   const [readerTocToken, setReaderTocToken] = useState<{
     bookId: string
     bookTitle: string
+    metadata?: EpubReaderV2BookMetadata
     chapters: Array<{
       title: string
       href: string
@@ -330,6 +356,11 @@ function App() {
     textOffset?: number
     href?: string
   } | null>(null)
+  const readerRef = useRef<EpubReaderV2Handle | null>(null)
+  const getCurrentReaderPage = useCallback(
+    () => readerRef.current?.getVisiblePage?.() ?? null,
+    [],
+  )
 
   const createInsertId = () => {
     if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) {
@@ -460,21 +491,93 @@ function App() {
       | { bookId: string; spineIndex: number; textOffset: number }
       | { bookId: string; href: string },
   ) => {
-    if (typeof window !== 'undefined') {
-      const enabled =
-        (window as any).__MFV2_DEBUG_CHAT_MENTIONS ||
-        (window as any).__MFV2_DEBUG_READER_NAV ||
-        window.localStorage?.getItem('mfv2_debug_chat_mentions') === '1' ||
-        window.localStorage?.getItem('mfv2_debug_reader_nav') === '1'
-      if (enabled) {
-        // eslint-disable-next-line no-console
-        console.log('[mfv2][reader][nav] from chat chip', payload)
-      }
+    const stripVariantSuffix = (raw: string) => {
+      const id = raw.trim()
+      const idx = id.lastIndexOf('@')
+      if (idx < 0) return id
+      const base = id.slice(0, idx)
+      const variant = id.slice(idx + 1)
+      if (!base) return id
+      if (
+        variant === 'original' ||
+        variant === 'modernify' ||
+        variant.startsWith('translate_')
+      )
+        return base
+      return id
     }
-    updateSelectedBook(payload.bookId)
+
+    const resolveTargetBookId = (raw: string) => {
+      const id = raw.trim()
+      if (!id) return null
+
+      const stripped = stripVariantSuffix(id)
+      const candidates = [stripped, id]
+
+      for (const candidate of candidates) {
+        if (!candidate) continue
+        if (books.some((b) => b.id === candidate)) return candidate
+      }
+
+      // Back-compat / defensive: some older chips may have stored a URL (original or transformed)
+      // instead of the library book id.
+      if (/^https?:\/\//i.test(id)) {
+        const found = books.find((b) => {
+          if (b.url === id) return true
+          const urls = Object.values(b.transformation_data).flat()
+          return urls.includes(id)
+        })
+        if (found) return found.id
+      }
+
+      return null
+    }
+
+    const resolveCanonicalVersionedBookId = (
+      raw: string,
+      resolvedId: string,
+    ) => {
+      const id = raw.trim()
+      if (!id) return resolvedId
+
+      // If this already looks like a versioned id for an existing book, keep it.
+      const stripped = stripVariantSuffix(id)
+      if (books.some((b) => b.id === stripped)) return id
+      if (books.some((b) => b.id === id)) return id
+
+      if (/^https?:\/\//i.test(id)) {
+        const found = books.find((b) => b.id === resolvedId)
+        if (found) {
+          const transformData = found.transformation_data as Record<
+            string,
+            Array<string> | undefined
+          >
+          const match = Object.entries(transformData).find(([, urls]) =>
+            (urls ?? []).includes(id),
+          )
+          const candidate = String(match?.[0] ?? '').trim()
+          const variant =
+            candidate === 'modernify' || candidate.startsWith('translate_')
+              ? candidate
+              : 'original'
+          return `${found.id}@${variant}`
+        }
+      }
+
+      return resolvedId
+    }
+
+    const targetBookId = resolveTargetBookId(payload.bookId)
+    if (!targetBookId) return
+    const canonicalBookId = resolveCanonicalVersionedBookId(
+      payload.bookId,
+      targetBookId,
+    )
+
+    updateSelectedBook(targetBookId)
     setPendingReaderNavigation({
       id: createInsertId(),
-      bookId: payload.bookId,
+      bookId: canonicalBookId,
       ...(typeof (payload as any).href === 'string'
         ? { href: (payload as any).href as string }
         : {
@@ -519,21 +622,63 @@ function App() {
     { includeIframes: true },
   )
 
-  const isLibraryLoading = isLoading && books.length === 0
+  const isLibraryLoading = booksQuery.isLoading && books.length === 0
+  const isSelectedBookLoading =
+    Boolean(selectedBookId) && selectedBookLoading && !selectedBook
   const isReaderLoading =
     Boolean(selectedBook) &&
     readerStatus !== 'ready' &&
     readerStatus !== 'error'
-  const showBlockingLoader = isLibraryLoading || isReaderLoading
+  const showBlockingLoader =
+    isLibraryLoading || isSelectedBookLoading || isReaderLoading
+
+  const requestNextBooksPage = useCallback(() => {
+    if (!hasNextBooksPage || isFetchingNextBooksPage) return
+    if (loadMoreInFlightRef.current) return
+    loadMoreInFlightRef.current = true
+    void fetchNextBooksPage().finally(() => {
+      loadMoreInFlightRef.current = false
+    })
+  }, [fetchNextBooksPage, hasNextBooksPage, isFetchingNextBooksPage])
 
   return (
     <div className="min-h-screen bg-[color:var(--paper-deep)] text-[color:var(--ink)]">
       <header className="h-9 px-4 flex items-center justify-between border-b border-[color:var(--accent-soft)] bg-[color:var(--paper)]">
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 shrink-0">
           <IoLibraryOutline className="w-4 h-4 text-[color:var(--accent)]" />
           <span className="text-[10px] text-[color:var(--accent)]">
             Alexandria0
           </span>
+        </div>
+        <div className="flex-1 px-3">
+          <div className="relative max-w-sm mx-auto">
+            <Search className="pointer-events-none absolute left-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-[color:var(--ink)]/50" />
+            <input
+              value={libraryQuery}
+              onChange={(e) => {
+                const next = e.target.value
+                setLibraryQuery(next)
+                listScrollRef.current?.scrollTo({ top: 0 })
+              }}
+              placeholder="Search title or author…"
+              className="w-full h-7 rounded-md border border-[color:var(--accent-soft)] bg-[color:var(--paper)] pl-7 pr-7 text-xs text-[color:var(--ink)] placeholder:text-[color:var(--ink)]/50 focus:outline-none focus:ring-2 focus:ring-[color:var(--accent-soft)]"
+              type="search"
+              spellCheck={false}
+            />
+            {libraryQuery.trim() !== '' && (
+              <button
+                type="button"
+                onClick={() => {
+                  setLibraryQuery('')
+                  listScrollRef.current?.scrollTo({ top: 0 })
+                }}
+                className="absolute right-1.5 top-1/2 -translate-y-1/2 rounded p-1 hover:bg-[color:var(--paper-deep)]"
+                aria-label="Clear search"
+              >
+                <X className="h-3.5 w-3.5 text-[color:var(--ink)]/60" />
+              </button>
+            )}
+          </div>
         </div>
         <TooltipProvider delayDuration={250}>
           <div className="flex items-center">
@@ -897,86 +1042,244 @@ function App() {
           <ResizableWindow
             storageKey={LIBRARY_PANEL_WIDTH_COOKIE}
             initialWidth={initialWidth}
-            className="overflow-y-auto border-r border-[color:var(--accent-soft)] bg-[color:var(--paper)]"
+            className="overflow-hidden border-r border-[color:var(--accent-soft)] bg-[color:var(--paper)]"
           >
-            <div className="flex items-center px-3 h-6 text-[10px] text-[color:var(--ink)]/60">
-              Public
-            </div>
-            <div className="pb-4">
-              {isLoading && (
-                <div className="flex items-center gap-2 px-3 text-[color:var(--ink)]/70 py-2 text-xs">
-                  <Loader2 className="w-3 h-3 animate-spin" />
-                  Loading…
-                </div>
-              )}
-              {error && (
-                <div className="px-3 text-[color:var(--accent)] py-2 text-xs">
-                  Failed to load books.
-                </div>
-              )}
-              {!isLoading && !error && books.length === 0 && (
-                <div className="px-3 text-[color:var(--ink)]/60 py-2 text-xs">
-                  No books yet.
-                </div>
-              )}
-              {!isLoading &&
-                !error &&
-                books.map((book: Book) => {
-                  const title = book.title.trim() || 'Untitled'
-                  const authors =
-                    book.authors.filter(Boolean).join(', ') || 'Unknown author'
-                  const hasThumbnail = Boolean(book.thumbnail_url.trim())
-                  const isSelected = selectedBookId === book.id
+            <div className="flex flex-col h-full">
+              {leftPanelView === 'library' ? (
+                <>
+                  <div className="h-6 flex items-center px-2 text-[10px] text-[color:var(--ink)]/60 border-b border-[color:var(--accent-soft)]">
+                    Library
+                  </div>
+                  <div className="p-1">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setLibraryScope('public')
+                        setLeftPanelView('books')
+                        listScrollRef.current?.scrollTo({ top: 0 })
+                      }}
+                      className={[
+                        'w-full rounded-md px-2 py-1 text-left text-xs transition-colors',
+                        libraryScope === 'public'
+                          ? 'bg-[color:var(--paper-deep)] text-[color:var(--ink)]'
+                          : 'text-[color:var(--ink)]/80 hover:bg-[color:var(--paper-deep)]',
+                      ].join(' ')}
+                      aria-pressed={libraryScope === 'public'}
+                    >
+                      Public
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        if (!me) return
+                        setLibraryScope('personal')
+                        setLeftPanelView('books')
+                        listScrollRef.current?.scrollTo({ top: 0 })
+                      }}
+                      disabled={!me}
+                      className={[
+                        'mt-1 w-full rounded-md px-2 py-1 text-left text-xs transition-colors',
+                        libraryScope === 'personal'
+                          ? 'bg-[color:var(--paper-deep)] text-[color:var(--ink)]'
+                          : 'text-[color:var(--ink)]/80 hover:bg-[color:var(--paper-deep)]',
+                        !me ? 'opacity-50 cursor-not-allowed' : '',
+                      ].join(' ')}
+                      aria-pressed={libraryScope === 'personal'}
+                    >
+                      Personal
+                    </button>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div className="h-6 flex items-center justify-between gap-2 px-2 border-b border-[color:var(--accent-soft)] text-[10px] text-[color:var(--ink)]/60">
+                    <button
+                      type="button"
+                      onClick={() => setLeftPanelView('library')}
+                      className="flex items-center gap-1 hover:text-[color:var(--ink)] transition-colors"
+                      aria-label="Back to Library"
+                    >
+                      <ChevronLeft className="w-3 h-3" />
+                      <span className="min-w-0 truncate">
+                        {libraryScope === 'public' ? 'Public' : 'Personal'}
+                      </span>
+                    </button>
+                    <div className="flex items-center gap-2 shrink-0">
+                      {booksQuery.isFetching && (
+                        <Loader2 className="w-3 h-3 animate-spin" />
+                      )}
+                    </div>
+                  </div>
 
-                  return (
-                    <HoverCard key={book.id} openDelay={150} closeDelay={75}>
-                      <HoverCardTrigger asChild>
-                        <button
-                          type="button"
-                          onClick={() => updateSelectedBook(book.id)}
-                          className={[
-                            'block w-full px-3 py-1 text-left text-xs transition-colors truncate',
-                            isSelected
-                              ? 'bg-[color:var(--paper-deep)] text-[color:var(--ink)]'
-                              : 'text-[color:var(--ink)]/90 hover:bg-[color:var(--paper-deep)]',
-                          ].join(' ')}
-                          aria-pressed={isSelected}
-                        >
-                          {title}
-                        </button>
-                      </HoverCardTrigger>
-                      <HoverCardContent
-                        side="right"
-                        align="start"
-                        sideOffset={8}
-                        className="w-80 border-[color:var(--accent-soft)] bg-[color:var(--paper)] text-[color:var(--ink)]"
-                      >
-                        <div className="flex gap-3">
-                          <div className="shrink-0">
-                            {hasThumbnail ? (
-                              <img
-                                src={book.thumbnail_url}
-                                alt={title}
-                                loading="lazy"
-                                className="h-16 w-12 rounded-sm border border-[color:var(--accent-soft)] object-cover bg-[color:var(--paper-deep)]"
-                              />
-                            ) : (
-                              <div className="h-16 w-12 rounded-sm border border-[color:var(--accent-soft)] bg-[color:var(--paper-deep)]" />
-                            )}
-                          </div>
-                          <div className="min-w-0">
-                            <div className="text-sm font-medium leading-snug">
-                              {title}
-                            </div>
-                            <div className="mt-1 text-xs text-[color:var(--ink)]/70 leading-snug">
-                              {authors}
-                            </div>
-                          </div>
+                  {libraryScope === 'personal' && !me ? (
+                    <div className="px-3 py-2 text-xs text-[color:var(--ink)]/60">
+                      Sign in to view your personal library.
+                    </div>
+                  ) : (
+                    <div
+                      ref={listScrollRef}
+                      className="flex-1 overflow-y-auto"
+                      onScroll={(e) => {
+                        if (!hasNextBooksPage || isFetchingNextBooksPage) return
+                        const el = e.currentTarget
+                        const canScroll = el.scrollHeight > el.clientHeight + 1
+                        if (!canScroll) return
+                        const remaining =
+                          el.scrollHeight - el.scrollTop - el.clientHeight
+                        if (remaining < 140) {
+                          requestNextBooksPage()
+                        }
+                      }}
+                    >
+                      {booksQuery.isLoading && books.length === 0 && (
+                        <div className="flex items-center gap-2 px-3 text-[color:var(--ink)]/70 py-2 text-xs">
+                          <Loader2 className="w-3 h-3 animate-spin" />
+                          Loading…
                         </div>
-                      </HoverCardContent>
-                    </HoverCard>
-                  )
-                })}
+                      )}
+                      {booksQuery.error && (
+                        <div className="px-3 text-[color:var(--accent)] py-2 text-xs">
+                          Failed to load books.
+                        </div>
+                      )}
+                      {!booksQuery.isLoading &&
+                        !booksQuery.error &&
+                        books.length === 0 && (
+                          <div className="px-3 text-[color:var(--ink)]/60 py-2 text-xs">
+                            No books yet.
+                          </div>
+                        )}
+
+                      {!booksQuery.isLoading && !booksQuery.error && (
+                        <div
+                          style={{
+                            height: `${rowVirtualizer.getTotalSize()}px`,
+                            width: '100%',
+                            position: 'relative',
+                          }}
+                        >
+                          {rowVirtualizer
+                            .getVirtualItems()
+                            .map((virtualRow) => {
+                              const index = virtualRow.index
+                              const isLoadMoreRow = index >= listCount
+
+                              return (
+                                <div
+                                  key={virtualRow.key}
+                                  ref={(el) => {
+                                    if (!el) return
+                                    rowVirtualizer.measureElement(el)
+                                  }}
+                                  data-index={index}
+                                  style={{
+                                    position: 'absolute',
+                                    top: 0,
+                                    left: 0,
+                                    width: '100%',
+                                    transform: `translateY(${virtualRow.start}px)`,
+                                  }}
+                                >
+                                  {isLoadMoreRow ? (
+                                    <div className="px-3 py-2 text-xs text-[color:var(--ink)]/60">
+                                      {isFetchingNextBooksPage ? (
+                                        <span className="inline-flex items-center gap-2">
+                                          <Loader2 className="w-3 h-3 animate-spin" />
+                                          Loading more…
+                                        </span>
+                                      ) : hasNextBooksPage ? (
+                                        <button
+                                          type="button"
+                                          className="text-left text-[color:var(--ink)]/70 hover:text-[color:var(--ink)] transition-colors"
+                                          onClick={requestNextBooksPage}
+                                        >
+                                          Load more
+                                        </button>
+                                      ) : (
+                                        'End of list.'
+                                      )}
+                                    </div>
+                                  ) : (
+                                    (() => {
+                                      const book = books[index]
+                                      if (!book) return null
+
+                                      const title =
+                                        book.title.trim() || 'Untitled'
+                                      const authors =
+                                        book.authors
+                                          .filter(Boolean)
+                                          .join(', ') || 'Unknown author'
+                                      const hasThumbnail = Boolean(
+                                        book.thumbnail_url.trim(),
+                                      )
+                                      const isSelected =
+                                        selectedBookId === book.id
+
+                                      return (
+                                        <HoverCard
+                                          openDelay={150}
+                                          closeDelay={75}
+                                        >
+                                          <HoverCardTrigger asChild>
+                                            <button
+                                              type="button"
+                                              onClick={() =>
+                                                updateSelectedBook(book.id)
+                                              }
+                                              className={[
+                                                'block w-full px-3 py-1 text-left text-xs transition-colors truncate',
+                                                isSelected
+                                                  ? 'bg-[color:var(--paper-deep)] text-[color:var(--ink)]'
+                                                  : 'text-[color:var(--ink)]/90 hover:bg-[color:var(--paper-deep)]',
+                                              ].join(' ')}
+                                              aria-pressed={isSelected}
+                                            >
+                                              {title}
+                                            </button>
+                                          </HoverCardTrigger>
+                                          <HoverCardContent
+                                            side="right"
+                                            align="start"
+                                            sideOffset={8}
+                                            className="w-80 border-[color:var(--accent-soft)] bg-[color:var(--paper)] text-[color:var(--ink)]"
+                                          >
+                                            <div className="flex gap-3">
+                                              <div className="shrink-0">
+                                                {hasThumbnail ? (
+                                                  <img
+                                                    src={book.thumbnail_url}
+                                                    alt={title}
+                                                    loading="lazy"
+                                                    className="h-16 w-12 rounded-sm border border-[color:var(--accent-soft)] object-cover bg-[color:var(--paper-deep)]"
+                                                  />
+                                                ) : (
+                                                  <div className="h-16 w-12 rounded-sm border border-[color:var(--accent-soft)] bg-[color:var(--paper-deep)]" />
+                                                )}
+                                              </div>
+                                              <div className="min-w-0">
+                                                <div className="text-sm font-medium leading-snug">
+                                                  {title}
+                                                </div>
+                                                <div className="mt-1 text-xs text-[color:var(--ink)]/70 leading-snug">
+                                                  {authors}
+                                                </div>
+                                              </div>
+                                            </div>
+                                          </HoverCardContent>
+                                        </HoverCard>
+                                      )
+                                    })()
+                                  )}
+                                </div>
+                              )
+                            })}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </>
+              )}
             </div>
           </ResizableWindow>
         )}
@@ -984,14 +1287,10 @@ function App() {
           {!isLibraryLoading && selectedBook ? (
             <div className="relative h-full">
               <EpubReaderV2
+                ref={readerRef}
                 storageId={selectedBook.id}
-                bookUrl={
-                  (
-                    selectedBook.transformation_data as Partial<
-                      Record<string, Array<string>>
-                    >
-                  ).modernify?.[0] || selectedBook.url
-                }
+                bookUrl={selectedBook.url}
+                transformationData={selectedBook.transformation_data}
                 onSelectionChange={setReaderSelectionToken}
                 onTocChange={setReaderTocToken}
                 pendingNavigation={pendingReaderNavigation}
@@ -1057,9 +1356,11 @@ function App() {
                   ? {
                       bookId: readerTocToken.bookId,
                       bookTitle: readerTocToken.bookTitle,
+                      metadata: readerTocToken.metadata,
                     }
                   : null
               }
+              getCurrentReaderPage={getCurrentReaderPage}
             />
           </ResizableWindow>
         </div>

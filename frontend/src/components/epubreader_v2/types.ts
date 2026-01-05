@@ -109,12 +109,43 @@ export type EpubReaderV2Rendition = {
   pageProgressionDirection: 'ltr' | 'rtl' | 'default';
 };
 
+export type EpubReaderV2BookMetadata = {
+  title?: string;
+  author?: string;
+  language?: string;
+  publisher?: string;
+  description?: string;
+  subjects?: string[];
+  date?: string;
+  identifier?: string;
+  modified?: string;
+};
+
+export type EpubReaderV2ContextPart =
+  | { type: 'text'; text: string }
+  | { type: 'image'; src: string; alt?: string; mediaType?: string };
+
+export type EpubReaderV2ReaderContext = {
+  kind: 'page' | 'selection';
+  href: string;
+  spineIndex: number;
+  pageIndex: number;
+  chapterTotalPages: number;
+  parts: EpubReaderV2ContextPart[];
+};
+
 export type EpubReaderV2Publication = {
   bookId: string;
   opfPath: string;
   title?: string;
   language?: string;
   author?: string;
+  publisher?: string;
+  description?: string;
+  subjects?: string[];
+  date?: string;
+  identifier?: string;
+  modified?: string;
   rendition: EpubReaderV2Rendition;
   spine: EpubReaderV2SpineItem[];
   toc: EpubReaderV2TocItem[];
@@ -132,6 +163,12 @@ export type EpubReaderV2ReadyPayload = {
   title?: string;
   author?: string;
   language?: string;
+  publisher?: string;
+  description?: string;
+  subjects?: string[];
+  date?: string;
+  identifier?: string;
+  modified?: string;
   spineItemCount: number;
   rendition: EpubReaderV2Rendition;
 };
@@ -155,4 +192,3 @@ export class EpubReaderV2Error extends Error {
     this.cause = cause;
   }
 }
-

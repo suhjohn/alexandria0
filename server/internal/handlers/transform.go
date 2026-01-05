@@ -31,6 +31,8 @@ type BookTransformHandler struct {
 }
 
 type startTransformRequest struct {
+	Type   string `json:"type,omitempty"`
+	Lang   string `json:"lang,omitempty"`
 	Prompt string `json:"prompt,omitempty"`
 }
 
@@ -47,11 +49,13 @@ type transformResponse struct {
 }
 
 type bookTransformResponse struct {
-	Status  string `json:"status"`
-	DestKey string `json:"dest_key"`
-	URL     string `json:"url,omitempty"`
-	CallID  string `json:"call_id,omitempty"`
-	Error   string `json:"error,omitempty"`
+	Status    string `json:"status"`
+	DestKey   string `json:"dest_key"`
+	URL       string `json:"url,omitempty"`
+	CallID    string `json:"call_id,omitempty"`
+	Error     string `json:"error,omitempty"`
+	CreatedAt string `json:"created_at,omitempty"`
+	UpdatedAt string `json:"updated_at,omitempty"`
 }
 
 func NewBookTransformHandler(
@@ -104,19 +108,43 @@ func (h *BookTransformHandler) StartTransform(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	url := modernifyURLFromBook(book, modernifyEPUBKey(book.ID))
-	if url != "" {
-		respondJSON(w, bookTransformResponse{
-			Status:  "ready",
-			DestKey: modernifyEPUBKey(book.ID),
-			URL:     url,
-		})
-		return
+	reqVariant := strings.TrimSpace(r.URL.Query().Get("type"))
+	if reqVariant == "" {
+		reqVariant = strings.TrimSpace(r.URL.Query().Get("variant"))
 	}
+	reqLang := strings.TrimSpace(r.URL.Query().Get("lang"))
 
 	var req startTransformRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
 		http.Error(w, "Invalid JSON body", http.StatusBadRequest)
+		return
+	}
+	if strings.TrimSpace(reqVariant) == "" {
+		reqVariant = strings.TrimSpace(req.Type)
+	}
+	if strings.TrimSpace(reqLang) == "" {
+		reqLang = strings.TrimSpace(req.Lang)
+	}
+
+	variantKey, variantErr := parseTransformVariantKey(reqVariant, reqLang)
+	if variantErr != nil {
+		http.Error(w, variantErr.Error(), http.StatusBadRequest)
+		return
+	}
+
+	url := transformURLFromBook(book, variantKey)
+	if url != "" {
+		destKey := transformEPUBKey(book.ID, variantKey)
+		if h.r2 != nil {
+			if key, ok := h.r2.KeyFromPublicURL(url); ok {
+				destKey = key
+			}
+		}
+		respondJSON(w, bookTransformResponse{
+			Status:  "ready",
+			DestKey: destKey,
+			URL:     url,
+		})
 		return
 	}
 
@@ -125,13 +153,19 @@ func (h *BookTransformHandler) StartTransform(w http.ResponseWriter, r *http.Req
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	destKey := modernifyEPUBKey(book.ID)
+	destKey := transformDestKey(book.ID, sourceKey, variantKey)
 
-	job, err := h.jobRepo.GetByBookID(r.Context(), book.ID)
+	job, err := h.jobRepo.GetByBookVariant(r.Context(), book.ID, variantKey)
 	if err == nil && job != nil && (job.Status == "pending" || job.Status == "running") {
+		jobDestKey := job.DestKey
+		if strings.TrimSpace(jobDestKey) == "" {
+			jobDestKey = destKey
+		}
 		respondJSON(w, bookTransformResponse{
-			Status:  job.Status,
-			DestKey: destKey,
+			Status:    job.Status,
+			DestKey:   jobDestKey,
+			CreatedAt: job.CreatedAt.UTC().Format(time.RFC3339),
+			UpdatedAt: job.UpdatedAt.UTC().Format(time.RFC3339),
 		})
 		return
 	}
@@ -146,15 +180,24 @@ func (h *BookTransformHandler) StartTransform(w http.ResponseWriter, r *http.Req
 		return
 	}
 
+	prompt := strings.TrimSpace(req.Prompt)
+	if strings.HasPrefix(variantKey, "translate_") {
+		langForPrompt := strings.TrimSpace(reqLang)
+		if langForPrompt == "" {
+			langForPrompt = strings.ReplaceAll(strings.TrimPrefix(variantKey, "translate_"), "_", " ")
+		}
+		prompt = translatePrompt(langForPrompt)
+	}
+
 	modalReq := transformRequest{
 		SourceKey: sourceKey,
 		DestKey:   destKey,
-		Prompt:    req.Prompt,
+		Prompt:    prompt,
 	}
 
 	respBody, status, err := h.postJSON(r, "/transform", modalReq)
 	if err != nil {
-		_, _ = h.jobRepo.Upsert(r.Context(), book.ID, destKey, "error", err.Error())
+		_, _ = h.jobRepo.Upsert(r.Context(), book.ID, variantKey, destKey, "error", err.Error())
 		http.Error(w, err.Error(), status)
 		return
 	}
@@ -165,17 +208,25 @@ func (h *BookTransformHandler) StartTransform(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	_, err = h.jobRepo.Upsert(r.Context(), book.ID, destKey, "running", "")
+	job, err = h.jobRepo.Upsert(r.Context(), book.ID, variantKey, destKey, "running", "")
 	if err != nil {
 		http.Error(w, "Failed to persist transform job", http.StatusInternalServerError)
 		return
 	}
 
+	createdAt := ""
+	updatedAt := ""
+	if job != nil {
+		createdAt = job.CreatedAt.UTC().Format(time.RFC3339)
+		updatedAt = job.UpdatedAt.UTC().Format(time.RFC3339)
+	}
 	respondJSON(w, bookTransformResponse{
-		Status:  "running",
-		DestKey: destKey,
-		URL:     modalResp.URL,
-		CallID:  modalResp.CallID,
+		Status:    "running",
+		DestKey:   destKey,
+		URL:       modalResp.URL,
+		CallID:    modalResp.CallID,
+		CreatedAt: createdAt,
+		UpdatedAt: updatedAt,
 	})
 }
 
@@ -206,57 +257,99 @@ func (h *BookTransformHandler) GetTransform(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	url := modernifyURLFromBook(book, modernifyEPUBKey(book.ID))
+	reqVariant := strings.TrimSpace(r.URL.Query().Get("type"))
+	if reqVariant == "" {
+		reqVariant = strings.TrimSpace(r.URL.Query().Get("variant"))
+	}
+	reqLang := strings.TrimSpace(r.URL.Query().Get("lang"))
+	variantKey, variantErr := parseTransformVariantKey(reqVariant, reqLang)
+	if variantErr != nil {
+		http.Error(w, variantErr.Error(), http.StatusBadRequest)
+		return
+	}
+
+	url := transformURLFromBook(book, variantKey)
 	if url != "" {
+		destKey := transformEPUBKey(book.ID, variantKey)
+		if h.r2 != nil {
+			if key, ok := h.r2.KeyFromPublicURL(url); ok {
+				destKey = key
+			}
+		}
 		respondJSON(w, bookTransformResponse{
 			Status:  "ready",
-			DestKey: modernifyEPUBKey(book.ID),
+			DestKey: destKey,
 			URL:     url,
 		})
 		return
 	}
 
-	destKey := modernifyEPUBKey(book.ID)
-	job, err := h.jobRepo.GetByBookID(r.Context(), book.ID)
+	sourceKey, sourceKeyErr := sourceEPUBKeyFromBook(book, h.r2)
+	destKeys := []string{transformEPUBKey(book.ID, variantKey)}
+	if variantKey == "modernify" && sourceKeyErr == nil && strings.TrimSpace(sourceKey) != "" {
+		destKeys = append([]string{modernifyDestKeyFromSourceKey(sourceKey)}, destKeys...)
+	}
+
+	job, err := h.jobRepo.GetByBookVariant(r.Context(), book.ID, variantKey)
 	if err != nil {
 		http.Error(w, "Failed to load transform status", http.StatusInternalServerError)
 		return
 	}
 	if job != nil && job.Status == "error" {
+		destKey := job.DestKey
+		if strings.TrimSpace(destKey) == "" {
+			destKey = destKeys[0]
+		}
 		respondJSON(w, bookTransformResponse{
-			Status:  "error",
-			DestKey: destKey,
-			Error:   job.LastError,
+			Status:    "error",
+			DestKey:   destKey,
+			Error:     job.LastError,
+			CreatedAt: job.CreatedAt.UTC().Format(time.RFC3339),
+			UpdatedAt: job.UpdatedAt.UTC().Format(time.RFC3339),
 		})
 		return
 	}
 	if job != nil && (job.Status == "pending" || job.Status == "running") {
+		destKey := job.DestKey
+		if strings.TrimSpace(destKey) == "" {
+			destKey = destKeys[0]
+		}
 		respondJSON(w, bookTransformResponse{
-			Status:  job.Status,
-			DestKey: destKey,
+			Status:    job.Status,
+			DestKey:   destKey,
+			CreatedAt: job.CreatedAt.UTC().Format(time.RFC3339),
+			UpdatedAt: job.UpdatedAt.UTC().Format(time.RFC3339),
 		})
 		return
 	}
 
-	ready, err := h.r2.Exists(r.Context(), destKey)
-	if err == nil && ready {
-		url := h.r2.PublicURL(destKey)
-		if err := h.repo.SetTransformURLs(r.Context(), book.ID, "modernify", []string{url}); err != nil {
+	var resolvedDestKey string
+	for _, key := range destKeys {
+		ready, err := h.r2.Exists(r.Context(), key)
+		if err == nil && ready {
+			resolvedDestKey = key
+			break
+		}
+	}
+
+	if resolvedDestKey != "" {
+		url := h.r2.PublicURL(resolvedDestKey)
+		if err := h.repo.SetTransformURLs(r.Context(), book.ID, variantKey, []string{url}); err != nil {
 			http.Error(w, "Failed to update transformation data", http.StatusInternalServerError)
 			return
 		}
-		_, _ = h.jobRepo.Upsert(r.Context(), book.ID, destKey, "completed", "")
+		_, _ = h.jobRepo.Upsert(r.Context(), book.ID, variantKey, resolvedDestKey, "completed", "")
 		respondJSON(w, bookTransformResponse{
 			Status:  "ready",
-			DestKey: destKey,
+			DestKey: resolvedDestKey,
 			URL:     url,
 		})
 		return
 	}
 
 	respondJSON(w, bookTransformResponse{
-		Status:  "pending",
-		DestKey: destKey,
+		Status:  "not_started",
+		DestKey: destKeys[0],
 	})
 }
 
@@ -328,10 +421,10 @@ func (h *BookTransformHandler) processJobs(ctx context.Context) {
 			continue
 		}
 		url := h.r2.PublicURL(job.DestKey)
-		if err := h.repo.SetTransformURLs(ctx, job.BookID, "modernify", []string{url}); err != nil {
+		if err := h.repo.SetTransformURLs(ctx, job.BookID, job.Variant, []string{url}); err != nil {
 			continue
 		}
-		_, _ = h.jobRepo.Upsert(ctx, job.BookID, job.DestKey, "completed", "")
+		_, _ = h.jobRepo.Upsert(ctx, job.BookID, job.Variant, job.DestKey, "completed", "")
 	}
 }
 
@@ -379,16 +472,35 @@ func modernifyEPUBKey(id uuid.UUID) string {
 	return fmt.Sprintf("books/%s/modernify.epub", id.String())
 }
 
+func transformEPUBKey(id uuid.UUID, variant string) string {
+	v := strings.TrimSpace(variant)
+	if v == "" || v == "modernify" {
+		return modernifyEPUBKey(id)
+	}
+	return fmt.Sprintf("books/%s/%s.epub", id.String(), v)
+}
+
+func modernifyDestKeyFromSourceKey(sourceKey string) string {
+	key := strings.TrimSpace(sourceKey)
+	if key == "" {
+		return ""
+	}
+	if strings.HasSuffix(strings.ToLower(key), ".epub") && len(key) >= len(".epub") {
+		key = key[:len(key)-len(".epub")]
+	}
+	return key + "_modernify.epub"
+}
+
 func respondJSON(w http.ResponseWriter, payload any) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(payload)
 }
 
-func modernifyURLFromBook(book *models.Book, destKey string) string {
+func transformURLFromBook(book *models.Book, variantKey string) string {
 	if book.TransformationData == nil {
 		return ""
 	}
-	urls := book.TransformationData["modernify"]
+	urls := book.TransformationData[variantKey]
 	if len(urls) > 0 && strings.TrimSpace(urls[0]) != "" {
 		return urls[0]
 	}
@@ -405,4 +517,72 @@ func sourceEPUBKeyFromBook(book *models.Book, r2 *storage.R2Client) (string, err
 		}
 	}
 	return "", errors.New("Book URL is not an R2 public URL")
+}
+
+func parseTransformVariantKey(transformType string, lang string) (string, error) {
+	t := strings.TrimSpace(transformType)
+	if t == "" {
+		t = "modernify"
+	}
+	if t == "modernify" {
+		return "modernify", nil
+	}
+	if strings.HasPrefix(t, "translate_") {
+		suffix := strings.TrimSpace(strings.TrimPrefix(t, "translate_"))
+		if suffix == "" {
+			return "", errors.New("Missing translate language")
+		}
+		if len([]rune(suffix)) > 30 {
+			return "", errors.New("Translate language must be less than 30 characters")
+		}
+		return "translate_" + suffix, nil
+	}
+	if t != "translate" {
+		return "", errors.New("Unsupported transform type")
+	}
+	slug, err := normalizeTranslateLang(lang)
+	if err != nil {
+		return "", err
+	}
+	return "translate_" + slug, nil
+}
+
+func normalizeTranslateLang(lang string) (string, error) {
+	raw := strings.TrimSpace(lang)
+	if raw == "" {
+		return "", errors.New("Missing translate language")
+	}
+	// Flexible input: just normalize whitespace to underscores and enforce a small length cap.
+	slug := strings.Join(strings.Fields(raw), "_")
+	if slug == "" {
+		return "", errors.New("Missing translate language")
+	}
+	if len([]rune(slug)) > 30 {
+		return "", errors.New("Translate language must be less than 30 characters")
+	}
+	if strings.Contains(slug, "/") || strings.Contains(slug, "\\") || strings.Contains(slug, "..") {
+		return "", errors.New("Invalid translate language")
+	}
+	return slug, nil
+}
+
+func transformDestKey(bookID uuid.UUID, sourceKey string, variantKey string) string {
+	if strings.TrimSpace(variantKey) == "" || variantKey == "modernify" {
+		return modernifyDestKeyFromSourceKey(sourceKey)
+	}
+	if strings.HasPrefix(variantKey, "translate_") {
+		return transformEPUBKey(bookID, variantKey)
+	}
+	return transformEPUBKey(bookID, variantKey)
+}
+
+func translatePrompt(lang string) string {
+	target := strings.TrimSpace(lang)
+	if target == "" {
+		target = "the requested language"
+	}
+	return fmt.Sprintf(
+		"Translate this text into %s while preserving the original meaning, tone, and proper nouns.",
+		target,
+	)
 }
