@@ -4,8 +4,11 @@ import {
   Bot,
   Check,
   ChevronLeft,
+  History,
+  KeyRound,
   Loader,
   Loader2,
+  MessageSquarePlus,
   Palette,
   PanelLeft,
   PanelLeftOpen,
@@ -20,7 +23,10 @@ import { IoLibraryOutline } from 'react-icons/io5'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useVirtualizer } from '@tanstack/react-virtual'
 import { getBook, searchBooks, type Book } from '@/data/books'
-import type { EpubReaderV2Handle, EpubReaderV2Status } from '@/components/epubreader_v2'
+import type {
+  EpubReaderV2Handle,
+  EpubReaderV2Status,
+} from '@/components/epubreader_v2'
 import type { EpubReaderV2BookMetadata } from '@/components/epubreader_v2/types'
 import type { EpubReaderV2ThemePreset } from '@/components/epubreader_v2/types'
 import { THEME_PRESETS } from '@/components/epubreader_v2/types'
@@ -51,6 +57,16 @@ import {
   updateReaderSettings,
   useReaderSettings,
 } from '@/lib/reader-settings'
+import {
+  CommandDialog,
+  CommandEmpty,
+  CommandGroup,
+  CommandInput,
+  CommandItem,
+  CommandList,
+  CommandSeparator,
+  CommandShortcut,
+} from '@/components/ui/command'
 import { getCookieValue, safeDecodeCookieValue } from '@/lib/cookies'
 import { useKeybindings } from '@/hooks/use-keybindings'
 import { useInfiniteCursorQuery } from '@/hooks/use-infinite-cursor-query'
@@ -158,6 +174,8 @@ function App() {
   const [settingsView, setSettingsView] = useState<'menu' | 'reader' | 'ai'>(
     'menu',
   )
+  const [commandPaletteOpen, setCommandPaletteOpen] = useState(false)
+  const [commandPaletteQuery, setCommandPaletteQuery] = useState('')
 
   const [geminiApiKey, setGeminiApiKey] = useState<string | null>(null)
   const [geminiKeyDraft, setGeminiKeyDraft] = useState('')
@@ -304,7 +322,7 @@ function App() {
     return visibleRaw ? safeDecodeCookieValue(visibleRaw) !== 'false' : false
   })
 
-  const [readerSelectionToken, setReaderSelectionToken] = useState<{
+  type ReaderSelectionToken = {
     bookId: string
     bookTitle: string
     spineIndex: number
@@ -313,7 +331,10 @@ function App() {
     endPage: number
     endIndex: number
     selectedText: string
-  } | null>(null)
+  }
+
+  const [readerSelectionToken, setReaderSelectionToken] =
+    useState<ReaderSelectionToken | null>(null)
   const [readerTocToken, setReaderTocToken] = useState<{
     bookId: string
     bookTitle: string
@@ -420,24 +441,45 @@ function App() {
     document.cookie = `${CHAT_PANEL_VISIBLE_COOKIE}=${encoded}; Max-Age=${PANEL_VISIBLE_MAX_AGE}; Path=/`
   }
 
+  const closeCommandPalette = () => {
+    setCommandPaletteOpen(false)
+    setCommandPaletteQuery('')
+  }
+
+  const toggleCommandPalette = () => {
+    if (commandPaletteOpen) {
+      closeCommandPalette()
+      return
+    }
+    setCommandPaletteQuery('')
+    setCommandPaletteOpen(true)
+  }
+
+  const insertSelectionToChat = (
+    selection: ReaderSelectionToken,
+    target: 'current' | 'newConversation',
+  ) => {
+    const nextInsertId = createInsertId()
+    setChatPanelVisible(true)
+    setChatPendingInsert({
+      id: nextInsertId,
+      kind: 'bookRef',
+      target,
+      bookId: selection.bookId,
+      bookTitle: selection.bookTitle,
+      startPage: selection.startPage,
+      startIndex: selection.startIndex,
+      endPage: selection.endPage,
+      endIndex: selection.endIndex,
+      selectedText: selection.selectedText,
+      spineIndex: selection.spineIndex,
+    })
+    setReaderSelectionToken(null)
+  }
+
   const handleModI = () => {
     if (readerSelectionToken) {
-      const nextInsertId = createInsertId()
-      setChatPanelVisible(true)
-      setChatPendingInsert({
-        id: nextInsertId,
-        kind: 'bookRef',
-        target: 'current',
-        bookId: readerSelectionToken.bookId,
-        bookTitle: readerSelectionToken.bookTitle,
-        startPage: readerSelectionToken.startPage,
-        startIndex: readerSelectionToken.startIndex,
-        endPage: readerSelectionToken.endPage,
-        endIndex: readerSelectionToken.endIndex,
-        selectedText: readerSelectionToken.selectedText,
-        spineIndex: readerSelectionToken.spineIndex,
-      })
-      setReaderSelectionToken(null)
+      insertSelectionToChat(readerSelectionToken, 'current')
       return
     }
 
@@ -451,21 +493,7 @@ function App() {
 
   const handleModShiftI = () => {
     if (readerSelectionToken) {
-      setChatPanelVisible(true)
-      setChatPendingInsert({
-        id: createInsertId(),
-        kind: 'bookRef',
-        target: 'newConversation',
-        bookId: readerSelectionToken.bookId,
-        bookTitle: readerSelectionToken.bookTitle,
-        startPage: readerSelectionToken.startPage,
-        startIndex: readerSelectionToken.startIndex,
-        endPage: readerSelectionToken.endPage,
-        endIndex: readerSelectionToken.endIndex,
-        selectedText: readerSelectionToken.selectedText,
-        spineIndex: readerSelectionToken.spineIndex,
-      })
-      setReaderSelectionToken(null)
+      insertSelectionToChat(readerSelectionToken, 'newConversation')
       return
     }
 
@@ -481,9 +509,32 @@ function App() {
     })
   }
 
+  const startNewChat = () => {
+    if (readerSelectionToken) {
+      insertSelectionToChat(readerSelectionToken, 'newConversation')
+      return
+    }
+
+    setChatPanelVisible(true)
+    setChatPendingConversationAction({
+      id: createInsertId(),
+      action: 'newConversation',
+    })
+  }
+
   const handleModShiftH = () => {
     setChatPanelVisible(true)
     setChatPendingHistoryToggle({ id: createInsertId() })
+  }
+
+  const openGeminiApiKeySettings = () => {
+    setSettingsPopoverOpen(true)
+    setSettingsView('ai')
+  }
+
+  const openThemesAndSettings = () => {
+    setSettingsPopoverOpen(true)
+    setSettingsView('reader')
   }
 
   const handleNavigateBookRef = (
@@ -587,6 +638,11 @@ function App() {
     })
   }
 
+  const runCommandPaletteAction = (action: () => void) => {
+    closeCommandPalette()
+    action()
+  }
+
   useKeybindings(
     [
       {
@@ -618,6 +674,21 @@ function App() {
         stopPropagation: true,
         handler: () => handleModShiftH(),
       },
+      {
+        command: 'ui.commandPalette',
+        keys: 'Mod+K',
+        allowInInput: true,
+        allowWhenDefaultPrevented: true,
+        stopPropagation: true,
+        handler: () => toggleCommandPalette(),
+      },
+      {
+        command: 'ui.closeCommandPalette',
+        keys: 'Escape',
+        allowInInput: true,
+        when: () => commandPaletteOpen,
+        handler: () => closeCommandPalette(),
+      },
     ],
     { includeIframes: true },
   )
@@ -643,6 +714,86 @@ function App() {
 
   return (
     <div className="min-h-screen bg-[color:var(--paper-deep)] text-[color:var(--ink)]">
+      <CommandDialog
+        open={commandPaletteOpen}
+        onOpenChange={(open) => {
+          setCommandPaletteOpen(open)
+          if (!open) setCommandPaletteQuery('')
+        }}
+      >
+        <CommandInput
+          value={commandPaletteQuery}
+          onValueChange={setCommandPaletteQuery}
+          placeholder={
+            isMac ? 'Type a command… (⌘K)' : 'Type a command… (Ctrl+K)'
+          }
+        />
+        <CommandList>
+          <CommandEmpty>No matches.</CommandEmpty>
+          <CommandGroup heading="Panels">
+            <CommandItem
+              value="left panel library"
+              onSelect={() => runCommandPaletteAction(togglePanelVisibility)}
+            >
+              <PanelLeft className="text-[color:var(--ink)]/70" />
+              <span>
+                {isPanelVisible ? 'Hide left panel' : 'Show left panel'}
+              </span>
+              <CommandShortcut>{isMac ? '⌘ B' : 'Ctrl B'}</CommandShortcut>
+            </CommandItem>
+            <CommandItem
+              value="right panel chat"
+              onSelect={() =>
+                runCommandPaletteAction(toggleChatPanelVisibility)
+              }
+            >
+              <PanelRight className="text-[color:var(--ink)]/70" />
+              <span>
+                {isChatPanelVisible ? 'Hide right panel' : 'Show right panel'}
+              </span>
+              <CommandShortcut>{isMac ? '⌘ I' : 'Ctrl I'}</CommandShortcut>
+            </CommandItem>
+          </CommandGroup>
+          <CommandGroup heading="Chat">
+            <CommandItem
+              value="new chat conversation"
+              onSelect={() => runCommandPaletteAction(startNewChat)}
+            >
+              <MessageSquarePlus className="text-[color:var(--ink)]/70" />
+              <span>New chat</span>
+              <CommandShortcut>
+                {isMac ? '⌘ ⇧ I' : 'Ctrl Shift I'}
+              </CommandShortcut>
+            </CommandItem>
+            <CommandItem
+              value="history chat conversations"
+              onSelect={() => runCommandPaletteAction(handleModShiftH)}
+            >
+              <History className="text-[color:var(--ink)]/70" />
+              <span>History</span>
+              <CommandShortcut>
+                {isMac ? '⌘ ⇧ H' : 'Ctrl Shift H'}
+              </CommandShortcut>
+            </CommandItem>
+          </CommandGroup>
+          <CommandGroup heading="Settings">
+            <CommandItem
+              value="gemini api key ai"
+              onSelect={() => runCommandPaletteAction(openGeminiApiKeySettings)}
+            >
+              <KeyRound className="text-[color:var(--ink)]/70" />
+              <span>Gemini API key</span>
+            </CommandItem>
+            <CommandItem
+              value="themes settings reader"
+              onSelect={() => runCommandPaletteAction(openThemesAndSettings)}
+            >
+              <Palette className="text-[color:var(--ink)]/70" />
+              <span>Themes & settings</span>
+            </CommandItem>
+          </CommandGroup>
+        </CommandList>
+      </CommandDialog>
       <header className="h-9 px-4 flex items-center justify-between border-b border-[color:var(--accent-soft)] bg-[color:var(--paper)]">
         <div className="flex items-center gap-2 shrink-0">
           <IoLibraryOutline className="w-4 h-4 text-[color:var(--accent)]" />
@@ -1292,6 +1443,9 @@ function App() {
                 bookUrl={selectedBook.url}
                 transformationData={selectedBook.transformation_data}
                 onSelectionChange={setReaderSelectionToken}
+                onAddSelectionToChat={(sel) =>
+                  insertSelectionToChat(sel, 'current')
+                }
                 onTocChange={setReaderTocToken}
                 pendingNavigation={pendingReaderNavigation}
                 onConsumePendingNavigation={(id) => {

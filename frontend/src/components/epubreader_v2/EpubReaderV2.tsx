@@ -8,6 +8,7 @@ import React, {
   useRef,
   useState,
 } from 'react'
+import { flushSync } from 'react-dom'
 import type {
   EpubReaderV2Location,
   EpubReaderV2BookMetadata,
@@ -40,6 +41,13 @@ import {
   startBookTransform,
   type TransformStatus,
 } from '@/data/books'
+import {
+  ContextMenu,
+  ContextMenuContent,
+  ContextMenuItem,
+  ContextMenuShortcut,
+  ContextMenuTrigger,
+} from '@/components/ui/context-menu'
 
 export type EpubReaderV2Handle = {
   next: () => void
@@ -65,6 +73,17 @@ export type EpubReaderV2Status =
   | 'ready'
   | 'error'
 
+type ReaderSelectionPayload = {
+  bookId: string
+  bookTitle: string
+  spineIndex: number
+  startPage: number
+  startIndex: number
+  endPage: number
+  endIndex: number
+  selectedText: string
+}
+
 export type EpubReaderV2Props = {
   bookUrl: string
   transformedBookUrl?: string
@@ -75,18 +94,8 @@ export type EpubReaderV2Props = {
   onReady?: (meta: EpubReaderV2ReadyPayload) => void
   onStatusChange?: (status: EpubReaderV2Status) => void
   onLocationChange?: (loc: EpubReaderV2Location) => void
-  onSelectionChange?: (
-    sel: {
-      bookId: string
-      bookTitle: string
-      spineIndex: number
-      startPage: number
-      startIndex: number
-      endPage: number
-      endIndex: number
-      selectedText: string
-    } | null,
-  ) => void
+  onSelectionChange?: (sel: ReaderSelectionPayload | null) => void
+  onAddSelectionToChat?: (sel: ReaderSelectionPayload) => void
   onTocChange?: (
     payload: {
       bookId: string
@@ -436,6 +445,7 @@ const EpubReaderV2Inner = forwardRef<
     onStatusChange,
     onLocationChange,
     onSelectionChange,
+    onAddSelectionToChat,
     onTocChange,
     pendingNavigation,
     onConsumePendingNavigation,
@@ -448,6 +458,7 @@ const EpubReaderV2Inner = forwardRef<
   const onStatusChangeRef = useRef(onStatusChange)
   const onLocationChangeRef = useRef(onLocationChange)
   const onSelectionChangeRef = useRef(onSelectionChange)
+  const onAddSelectionToChatRef = useRef(onAddSelectionToChat)
   const onTocChangeRef = useRef(onTocChange)
   const onConsumePendingNavigationRef = useRef(onConsumePendingNavigation)
   const onErrorRef = useRef(onError)
@@ -455,6 +466,7 @@ const EpubReaderV2Inner = forwardRef<
   onStatusChangeRef.current = onStatusChange
   onLocationChangeRef.current = onLocationChange
   onSelectionChangeRef.current = onSelectionChange
+  onAddSelectionToChatRef.current = onAddSelectionToChat
   onTocChangeRef.current = onTocChange
   onConsumePendingNavigationRef.current = onConsumePendingNavigation
   onErrorRef.current = onError
@@ -463,6 +475,20 @@ const EpubReaderV2Inner = forwardRef<
   const iframeRef = useRef<HTMLIFrameElement>(null)
   const { width: containerWidth, height: containerHeight } =
     useElementSize(containerRef)
+
+  const isMac = useMemo(() => {
+    if (typeof navigator === 'undefined') return false
+    const platform =
+      (navigator as any).userAgentData?.platform ??
+      navigator.platform ??
+      navigator.userAgent
+    return /mac/i.test(String(platform))
+  }, [])
+  const modIShortcut = isMac ? '⌘I' : 'Ctrl+I'
+
+  const contextMenuTriggerRef = useRef<HTMLDivElement | null>(null)
+  const contextMenuSelectionRef = useRef<ReaderSelectionPayload | null>(null)
+  const [contextMenuSelectionText, setContextMenuSelectionText] = useState('')
 
   const [status, setStatus] = useState<ReaderStatus>('idle')
   const [error, setError] = useState<string | null>(null)
@@ -648,6 +674,37 @@ const EpubReaderV2Inner = forwardRef<
       toastTimerRef.current = window.setTimeout(() => setToast(null), 3500)
     },
     [],
+  )
+
+  const copyTextToClipboard = useCallback(
+    async (text: string) => {
+      const value = String(text ?? '')
+      if (!value) return
+      try {
+        await navigator.clipboard.writeText(value)
+        showToast('Copied to clipboard.')
+        return
+      } catch {
+        // ignore
+      }
+
+      try {
+        const el = document.createElement('textarea')
+        el.value = value
+        el.setAttribute('readonly', 'true')
+        el.style.position = 'fixed'
+        el.style.opacity = '0'
+        el.style.left = '-9999px'
+        document.body.appendChild(el)
+        el.select()
+        document.execCommand('copy')
+        document.body.removeChild(el)
+        showToast('Copied to clipboard.')
+      } catch {
+        showToast('Failed to copy.', 'error')
+      }
+    },
+    [showToast],
   )
 
   const [spineIndex, setSpineIndex] = useState(0)
@@ -2078,14 +2135,10 @@ const EpubReaderV2Inner = forwardRef<
       return title || null
     }
 
-    const publishSelection = () => {
-      const cb = onSelectionChangeRef.current
-      if (!cb) return
-
+    const getSelectionPayload = (): ReaderSelectionPayload | null => {
       const selection = win.getSelection?.()
       if (!selection || selection.isCollapsed) {
-        cb(null)
-        return
+        return null
       }
 
       const layout = appliedLayoutRef.current
@@ -2157,7 +2210,7 @@ const EpubReaderV2Inner = forwardRef<
       )
       if (prefixKnown) {
         const base = (prefix as Array<number>).reduce((a, b) => a + b, 0)
-        cb({
+        return {
           bookId,
           bookTitle,
           spineIndex,
@@ -2166,11 +2219,10 @@ const EpubReaderV2Inner = forwardRef<
           endPage: base + endPage,
           endIndex,
           selectedText,
-        })
-        return
+        }
       }
 
-      cb({
+      return {
         bookId,
         bookTitle,
         spineIndex,
@@ -2179,7 +2231,15 @@ const EpubReaderV2Inner = forwardRef<
         endPage,
         endIndex,
         selectedText,
-      })
+      }
+    }
+
+    const publishSelection = () => {
+      const cb = onSelectionChangeRef.current
+      if (!cb) return null
+      const payload = getSelectionPayload()
+      cb(payload)
+      return payload
     }
 
     const handleClick = (event: MouseEvent) => {
@@ -2216,6 +2276,33 @@ const EpubReaderV2Inner = forwardRef<
       // Just show/hide HUD on click, don't navigate
       onSelectionChangeRef.current?.(null)
       showHudRef.current()
+    }
+
+    const handleContextMenu = (event: MouseEvent) => {
+      if (event.defaultPrevented) return
+      event.preventDefault()
+      event.stopPropagation()
+
+      const payload = getSelectionPayload()
+      contextMenuSelectionRef.current = payload
+      flushSync(() => {
+        setContextMenuSelectionText(payload?.selectedText ?? '')
+      })
+      onSelectionChangeRef.current?.(payload)
+
+      const triggerEl = contextMenuTriggerRef.current
+      if (!triggerEl) return
+      const iframeRect = iframeRef.current?.getBoundingClientRect()
+      const clientX = (iframeRect?.left ?? 0) + event.clientX
+      const clientY = (iframeRect?.top ?? 0) + event.clientY
+      triggerEl.dispatchEvent(
+        new MouseEvent('contextmenu', {
+          bubbles: true,
+          cancelable: true,
+          clientX,
+          clientY,
+        }),
+      )
     }
 
     const handleMouseMove = () => showHudRef.current()
@@ -2278,12 +2365,14 @@ const EpubReaderV2Inner = forwardRef<
     }
 
     doc.addEventListener('click', handleClick, true)
+    doc.addEventListener('contextmenu', handleContextMenu, true)
     doc.addEventListener('mousemove', handleMouseMove)
     doc.addEventListener('pointerdown', handlePointerDown, { capture: true })
     doc.addEventListener('pointerup', handlePointerUp, { capture: true })
     doc.addEventListener('keydown', handleKeyDown, true)
     return () => {
       doc.removeEventListener('click', handleClick, true)
+      doc.removeEventListener('contextmenu', handleContextMenu, true)
       doc.removeEventListener('mousemove', handleMouseMove)
       doc.removeEventListener('pointerdown', handlePointerDown as any, true)
       doc.removeEventListener('pointerup', handlePointerUp as any, true)
@@ -2764,6 +2853,41 @@ const EpubReaderV2Inner = forwardRef<
       tabIndex={0}
       aria-label="EPUB reader"
     >
+      <ContextMenu>
+        <ContextMenuTrigger asChild>
+          <div
+            ref={contextMenuTriggerRef}
+            style={{
+              position: 'fixed',
+              left: 0,
+              top: 0,
+              width: 1,
+              height: 1,
+              pointerEvents: 'none',
+              opacity: 0,
+            }}
+          />
+        </ContextMenuTrigger>
+        <ContextMenuContent>
+          <ContextMenuItem
+            disabled={!contextMenuSelectionText.trim()}
+            onSelect={() => void copyTextToClipboard(contextMenuSelectionText)}
+          >
+            Copy
+          </ContextMenuItem>
+          <ContextMenuItem
+            disabled={!contextMenuSelectionText.trim()}
+            onSelect={() => {
+              const payload = contextMenuSelectionRef.current
+              if (!payload) return
+              onAddSelectionToChatRef.current?.(payload)
+            }}
+          >
+            Add to chat
+            <ContextMenuShortcut>{modIShortcut}</ContextMenuShortcut>
+          </ContextMenuItem>
+        </ContextMenuContent>
+      </ContextMenu>
       <style>{`
         .mfv2-reader__hud {
           position: absolute;

@@ -17,6 +17,8 @@
   "dependencies": {
     "@ai-sdk/google": "^3.0.2",
     "@cloudflare/vite-plugin": "^1.13.8",
+    "@radix-ui/react-context-menu": "^2.2.16",
+    "@radix-ui/react-dialog": "^1.1.15",
     "@radix-ui/react-hover-card": "^1.1.15",
     "@radix-ui/react-popover": "^1.1.15",
     "@radix-ui/react-tooltip": "^1.2.8",
@@ -37,6 +39,7 @@
     "@tiptap/starter-kit": "^3.14.0",
     "ai": "^6.0.6",
     "clsx": "^2.1.1",
+    "cmdk": "^1.1.1",
     "epubjs": "^0.3.93",
     "lucide-react": "^0.561.0",
     "pako": "^2.1.0",
