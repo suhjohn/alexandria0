@@ -1,11 +1,14 @@
-import { createFileRoute } from '@tanstack/react-router'
+import { createFileRoute, Link } from '@tanstack/react-router'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   Bot,
   Check,
+  Chrome,
   ChevronLeft,
   History,
   KeyRound,
+  LogIn,
+  LogOut,
   Loader,
   Loader2,
   MessageSquarePlus,
@@ -18,7 +21,7 @@ import {
   Settings,
   X,
 } from 'lucide-react'
-import { IoLibraryOutline } from 'react-icons/io5'
+import { IoLibraryOutline, IoLogoGoogle } from 'react-icons/io5'
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useVirtualizer } from '@tanstack/react-virtual'
@@ -30,7 +33,7 @@ import type {
 import type { EpubReaderV2BookMetadata } from '@/components/epubreader_v2/types'
 import type { EpubReaderV2ThemePreset } from '@/components/epubreader_v2/types'
 import { THEME_PRESETS } from '@/components/epubreader_v2/types'
-import { getMe, logout } from '@/data/auth'
+import { apiBaseUrl, getMe, logout } from '@/data/auth'
 import { EpubReaderV2 } from '@/components/epubreader_v2'
 import { ResizableWindow } from '@/components/ui/resizable-window'
 import { ChatSidePanel } from '@/components/chat/ChatSidePanel'
@@ -239,6 +242,12 @@ function App() {
       queryClient.invalidateQueries({ queryKey: ['me'] })
     },
   })
+
+  const redirectAfterLogin =
+    typeof window === 'undefined'
+      ? '/'
+      : `${window.location.pathname}${window.location.search}`
+  const googleLoginHref = `${apiBaseUrl()}/auth/google/start?redirect=${encodeURIComponent(redirectAfterLogin)}`
 
   const [libraryScope, setLibraryScope] = useState<'public' | 'personal'>(
     'public',
@@ -792,6 +801,33 @@ function App() {
               <span>Themes & settings</span>
             </CommandItem>
           </CommandGroup>
+          <CommandGroup heading="Account">
+            {me ? (
+              <CommandItem
+                value="logout sign out"
+                onSelect={() =>
+                  runCommandPaletteAction(() => logoutMutation.mutate())
+                }
+              >
+                <LogOut className="text-[color:var(--ink)]/70" />
+                <span>Log out</span>
+              </CommandItem>
+            ) : (
+              <>
+                <CommandItem
+                  value="login google sign in oauth"
+                  onSelect={() =>
+                    runCommandPaletteAction(() => {
+                      window.location.href = googleLoginHref
+                    })
+                  }
+                >
+                  <IoLogoGoogle className="text-[color:var(--ink)]/70" />
+                  <span>Sign in with Google</span>
+                </CommandItem>
+              </>
+            )}
+          </CommandGroup>
         </CommandList>
       </CommandDialog>
       <header className="h-9 px-4 flex items-center justify-between border-b border-[color:var(--accent-soft)] bg-[color:var(--paper)]">
@@ -946,6 +982,44 @@ function App() {
                         </span>
                       </div>
                     </button>
+                    <div className="mt-1 border-t border-[color:var(--accent-soft)] pt-1">
+                      {me ? (
+                        <>
+                          <div className="px-3 py-2 text-xs text-[color:var(--ink)]/60">
+                            Signed in as{' '}
+                            <span className="font-medium text-[color:var(--ink)]/80">
+                              {me.email}
+                            </span>
+                          </div>
+                          <button
+                            type="button"
+                            className="w-full px-3 py-2 text-left text-sm hover:bg-[color:var(--paper-deep)] transition-colors"
+                            onClick={() => {
+                              setSettingsPopoverOpen(false)
+                              logoutMutation.mutate()
+                            }}
+                          >
+                            <div className="flex items-center gap-2">
+                              <LogOut className="w-4 h-4" />
+                              <span>Log out</span>
+                            </div>
+                          </button>
+                        </>
+                      ) : (
+                        <>
+                          <a
+                            href={googleLoginHref}
+                            className="block w-full px-3 py-2 text-left text-sm hover:bg-[color:var(--paper-deep)] transition-colors"
+                            onClick={() => setSettingsPopoverOpen(false)}
+                          >
+                            <div className="flex items-center gap-2">
+                              <IoLogoGoogle className="w-4 h-4" />
+                              <span>Sign in with Google</span>
+                            </div>
+                          </a>
+                        </>
+                      )}
+                    </div>
                   </div>
                 ) : settingsView === 'reader' ? (
                   <div className="p-3">

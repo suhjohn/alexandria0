@@ -171,6 +171,8 @@ func runServe(cmd *cobra.Command, args []string) error {
 	r.Get("/books/{id}/transform", transformHandler.GetTransform)
 	r.Post("/auth/request", authHandler.RequestMagicLink)
 	r.Get("/auth/verify", authHandler.VerifyMagicLink)
+	r.Get("/auth/google/start", authHandler.StartGoogleOAuth)
+	r.Get("/auth/google/callback", authHandler.GoogleCallback)
 	r.Get("/auth/me", authHandler.Me)
 	r.Post("/auth/logout", authHandler.Logout)
 

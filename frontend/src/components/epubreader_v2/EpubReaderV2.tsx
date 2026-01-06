@@ -275,7 +275,7 @@ function parseVersionedBookId(raw: string): {
 }
 
 function variantLabel(variant: ReaderVariant) {
-  if (variant === 'modernify') return 'Modernify'
+  if (variant === 'modernify') return 'Modernize'
   if (variant === 'original') return 'Original'
   const lang = langFromTranslateVariant(variant)
   return `Translate: ${lang}`
@@ -336,7 +336,8 @@ function mergeTransformStatus(
   next: TransformStatus,
 ): TransformStatus {
   if (!prev) return next
-  if (next.status === 'not_started' && prev.status !== 'not_started') return prev
+  if (next.status === 'not_started' && prev.status !== 'not_started')
+    return prev
   return { ...prev, ...next }
 }
 
@@ -600,39 +601,40 @@ const EpubReaderV2Inner = forwardRef<
     let cancelled = false
     let timer: number | null = null
 
-      const tick = async () => {
-        try {
-          const results = await Promise.all(
-            runningKeys.map(async (key) => {
-              const opts = transformOptionsForVariant(key)
-              const status = await getBookTransform(bookId, opts)
-              return { key, status }
-            }),
+    const tick = async () => {
+      try {
+        const results = await Promise.all(
+          runningKeys.map(async (key) => {
+            const opts = transformOptionsForVariant(key)
+            const status = await getBookTransform(bookId, opts)
+            return { key, status }
+          }),
+        )
+        if (cancelled) return
+        const mergedByKey = new Map<ReaderVariant, TransformStatus>()
+        for (const r of results) {
+          const merged = mergeTransformStatus(
+            transformStatusesRef.current[r.key],
+            r.status,
           )
-          if (cancelled) return
-          const mergedByKey = new Map<ReaderVariant, TransformStatus>()
-          for (const r of results) {
-            const merged = mergeTransformStatus(
-              transformStatusesRef.current[r.key],
-              r.status,
-            )
-            mergedByKey.set(r.key, merged)
-          }
-          setTransformStatuses((prev) => {
-            const next = { ...prev }
-            for (const r of results)
-              next[r.key] = mergeTransformStatus(prev[r.key], r.status)
-            return next
-          })
-          const stillRunning = runningKeys.some((key) => {
-            const status = mergedByKey.get(key) ?? transformStatusesRef.current[key]
-            return status?.status === 'pending' || status?.status === 'running'
-          })
-          if (stillRunning) timer = window.setTimeout(tick, 5000)
-        } catch {
-          if (cancelled) return
-          timer = window.setTimeout(tick, 10_000)
+          mergedByKey.set(r.key, merged)
         }
+        setTransformStatuses((prev) => {
+          const next = { ...prev }
+          for (const r of results)
+            next[r.key] = mergeTransformStatus(prev[r.key], r.status)
+          return next
+        })
+        const stillRunning = runningKeys.some((key) => {
+          const status =
+            mergedByKey.get(key) ?? transformStatusesRef.current[key]
+          return status?.status === 'pending' || status?.status === 'running'
+        })
+        if (stillRunning) timer = window.setTimeout(tick, 5000)
+      } catch {
+        if (cancelled) return
+        timer = window.setTimeout(tick, 10_000)
+      }
     }
 
     tick()
@@ -808,10 +810,60 @@ const EpubReaderV2Inner = forwardRef<
     return { spineIndex: currentSpineIndex, chapterProgress }
   }, [spineIndex])
 
-    const startModernify = useCallback(async () => {
+  const startModernify = useCallback(async () => {
+    const bookId = baseStorageId
+    if (!bookId) return
+    const key: ReaderVariant = 'modernify'
+    if (transformStartInFlightRef.current[key]) return
+    transformStartInFlightRef.current[key] = true
+    // Optimistically mark as running so the UI reacts immediately.
+    const optimisticNow = new Date().toISOString()
+    setTransformStatuses((prev) => ({
+      ...prev,
+      [key]: {
+        status: 'pending',
+        dest_key: prev[key]?.dest_key ?? '',
+        created_at: prev[key]?.created_at ?? optimisticNow,
+        updated_at: optimisticNow,
+      },
+    }))
+    try {
+      const status = await startBookTransform(bookId, { type: 'modernify' })
+      setTransformStatuses((prev) => ({
+        ...prev,
+        [key]: mergeTransformStatus(prev[key], status),
+      }))
+      if (status.status === 'error') {
+        showToast(
+          `Modernize failed: ${status.error ?? 'Unknown error'}`,
+          'error',
+        )
+      }
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : 'Failed to start transform'
+      showToast(`Modernize failed: ${message}`, 'error')
+      setTransformStatuses((prev) => ({
+        ...prev,
+        [key]: { status: 'error', dest_key: '', error: message },
+      }))
+    } finally {
+      transformStartInFlightRef.current[key] = false
+    }
+  }, [baseStorageId, showToast])
+
+  const startTranslate = useCallback(
+    async (langInput: string) => {
       const bookId = baseStorageId
       if (!bookId) return
-      const key: ReaderVariant = 'modernify'
+      const normalizedLang = normalizeTranslateLangInput(langInput)
+      if (!normalizedLang) {
+        setTranslateLangError('Enter a language (≤ 60 chars).')
+        return
+      }
+
+      setTranslateLangError(null)
+      const key = translateVariantKeyFromLang(normalizedLang) as ReaderVariant
       if (transformStartInFlightRef.current[key]) return
       transformStartInFlightRef.current[key] = true
       // Optimistically mark as running so the UI reacts immediately.
@@ -826,69 +878,19 @@ const EpubReaderV2Inner = forwardRef<
         },
       }))
       try {
-        const status = await startBookTransform(bookId, { type: 'modernify' })
+        const status = await startBookTransform(bookId, {
+          type: 'translate',
+          lang: normalizedLang,
+        })
         setTransformStatuses((prev) => ({
           ...prev,
           [key]: mergeTransformStatus(prev[key], status),
         }))
         if (status.status === 'error') {
           showToast(
-            `Modernify failed: ${status.error ?? 'Unknown error'}`,
+            `Translate failed: ${status.error ?? 'Unknown error'}`,
             'error',
           )
-      }
-    } catch (err) {
-      const message =
-        err instanceof Error ? err.message : 'Failed to start transform'
-      showToast(`Modernify failed: ${message}`, 'error')
-      setTransformStatuses((prev) => ({
-        ...prev,
-        [key]: { status: 'error', dest_key: '', error: message },
-      }))
-    } finally {
-      transformStartInFlightRef.current[key] = false
-    }
-  }, [baseStorageId, showToast])
-
-    const startTranslate = useCallback(
-      async (langInput: string) => {
-      const bookId = baseStorageId
-      if (!bookId) return
-      const normalizedLang = normalizeTranslateLangInput(langInput)
-      if (!normalizedLang) {
-        setTranslateLangError('Enter a language (≤ 60 chars).')
-        return
-      }
-
-        setTranslateLangError(null)
-        const key = translateVariantKeyFromLang(normalizedLang) as ReaderVariant
-        if (transformStartInFlightRef.current[key]) return
-        transformStartInFlightRef.current[key] = true
-        // Optimistically mark as running so the UI reacts immediately.
-        const optimisticNow = new Date().toISOString()
-        setTransformStatuses((prev) => ({
-          ...prev,
-          [key]: {
-            status: 'pending',
-            dest_key: prev[key]?.dest_key ?? '',
-            created_at: prev[key]?.created_at ?? optimisticNow,
-            updated_at: optimisticNow,
-          },
-        }))
-        try {
-          const status = await startBookTransform(bookId, {
-            type: 'translate',
-            lang: normalizedLang,
-          })
-          setTransformStatuses((prev) => ({
-            ...prev,
-            [key]: mergeTransformStatus(prev[key], status),
-          }))
-          if (status.status === 'error') {
-            showToast(
-              `Translate failed: ${status.error ?? 'Unknown error'}`,
-              'error',
-            )
         }
       } catch (err) {
         const message =
@@ -902,8 +904,8 @@ const EpubReaderV2Inner = forwardRef<
         transformStartInFlightRef.current[key] = false
       }
     },
-      [baseStorageId, showToast],
-    )
+    [baseStorageId, showToast],
+  )
 
   const switchVariant = useCallback(
     (
@@ -3803,11 +3805,11 @@ const EpubReaderV2Inner = forwardRef<
                   />
                 )}
               </button>
-                {modernifyAvailable ? (
-                  <button
-                    className={`mfv2-reader__versionOption ${variant === 'modernify' ? 'is-active' : ''}`}
-                    type="button"
-                    disabled={!modernifyAvailable}
+              {modernifyAvailable ? (
+                <button
+                  className={`mfv2-reader__versionOption ${variant === 'modernify' ? 'is-active' : ''}`}
+                  type="button"
+                  disabled={!modernifyAvailable}
                   onClick={() => {
                     switchVariant('modernify', {
                       preserveChapterProgress: true,
@@ -3815,7 +3817,7 @@ const EpubReaderV2Inner = forwardRef<
                     setVersionsOpen(false)
                   }}
                 >
-                  <span>Modernify</span>
+                  <span>Modernize</span>
                   {variant === 'modernify' && (
                     <IoCheckmarkCircle
                       className="w-4 h-4"
@@ -3823,36 +3825,38 @@ const EpubReaderV2Inner = forwardRef<
                     />
                   )}
                 </button>
-                ) : (
-                  <div className="h-10 hover:bg-transparent px-3 w-full flex justify-between items-center">
-                    <span className="mfv2-reader__versionOptionText">
-                      Modernify
-                    </span>
-                    <button
-                      className="mfv2-reader__versionMetaButton"
-                      type="button"
-                      disabled={modernifyBusy && !modernifyStuck}
-                      title={
-                        modernifyBusy && !modernifyStuck
-                          ? 'Modernifying…'
-                          : modernifyBusy && modernifyStuck
-                            ? 'Modernify appears stuck. Restart the job.'
-                            : modernifyError || 'Create a modernified version'
-                      }
-                      onClick={() => {
-                        void startModernify()
-                      }}
-                    >
-                      {modernifyBusy && modernifyStuck
-                        ? 'Restart'
-                        : modernifyBusy
-                          ? <Loader2 className="w-4 h-4 animate-spin" />
-                          : modernifyError
-                            ? 'Retry'
-                            : 'Create'}
-                    </button>
-                  </div>
-                )}
+              ) : (
+                <div className="h-10 hover:bg-transparent px-3 w-full flex justify-between items-center">
+                  <span className="mfv2-reader__versionOptionText">
+                    Modernize
+                  </span>
+                  <button
+                    className="mfv2-reader__versionMetaButton"
+                    type="button"
+                    disabled={modernifyBusy && !modernifyStuck}
+                    title={
+                      modernifyBusy && !modernifyStuck
+                        ? 'Modernifying…'
+                        : modernifyBusy && modernifyStuck
+                          ? 'Modernize appears stuck. Restart the job.'
+                          : modernifyError || 'Create a modernified version'
+                    }
+                    onClick={() => {
+                      void startModernify()
+                    }}
+                  >
+                    {modernifyBusy && modernifyStuck ? (
+                      'Restart'
+                    ) : modernifyBusy ? (
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                    ) : modernifyError ? (
+                      'Retry'
+                    ) : (
+                      'Create'
+                    )}
+                  </button>
+                </div>
+              )}
               {translateVariants.map((key) => {
                 const fromStatus =
                   transformStatuses[key]?.status === 'ready'

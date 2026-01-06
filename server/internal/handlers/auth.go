@@ -26,22 +26,32 @@ const (
 	sessionCookieName = "session_id"
 	magicLinkTTL      = 15 * time.Minute
 	sessionTTL        = 30 * 24 * time.Hour
+	oauthStateCookie  = "oauth_state"
+	oauthRedirCookie  = "oauth_redirect"
+	oauthStateTTL     = 10 * time.Minute
 )
 
+var ErrResendNotConfigured = errors.New("resend not configured")
+
 type AuthHandler struct {
-	users   *models.UserRepository
-	tokens  *models.MagicLinkTokenRepository
-	sessions *models.SessionRepository
+	users        *models.UserRepository
+	tokens       *models.MagicLinkTokenRepository
+	sessions     *models.SessionRepository
 	resendAPIKey string
 	resendFrom   string
 	appURL       string
 	apiURL       string
 	isProduction bool
 	httpClient   *http.Client
+
+	googleClientID     string
+	googleClientSecret string
+	googleRedirectURI  string
 }
 
 type magicLinkRequest struct {
-	Email string `json:"email"`
+	Email    string `json:"email"`
+	Redirect string `json:"redirect,omitempty"`
 }
 
 type authUserResponse struct {
@@ -63,15 +73,19 @@ func NewAuthHandler(
 		apiURL = "http://localhost:8080"
 	}
 	return &AuthHandler{
-		users:         users,
-		tokens:        tokens,
-		sessions:      sessions,
-		resendAPIKey:  strings.TrimSpace(os.Getenv("RESEND_API_KEY")),
-		resendFrom:    strings.TrimSpace(os.Getenv("RESEND_FROM")),
-		appURL:        appURL,
-		apiURL:        strings.TrimRight(apiURL, "/"),
-		isProduction:  strings.EqualFold(os.Getenv("APP_ENV"), "production"),
-		httpClient:    &http.Client{Timeout: 10 * time.Second},
+		users:        users,
+		tokens:       tokens,
+		sessions:     sessions,
+		resendAPIKey: strings.TrimSpace(os.Getenv("RESEND_API_KEY")),
+		resendFrom:   strings.TrimSpace(os.Getenv("RESEND_FROM")),
+		appURL:       appURL,
+		apiURL:       strings.TrimRight(apiURL, "/"),
+		isProduction: strings.EqualFold(os.Getenv("APP_ENV"), "production"),
+		httpClient:   &http.Client{Timeout: 10 * time.Second},
+
+		googleClientID:     strings.TrimSpace(os.Getenv("GOOGLE_CLIENT_ID")),
+		googleClientSecret: strings.TrimSpace(os.Getenv("GOOGLE_CLIENT_SECRET")),
+		googleRedirectURI:  strings.TrimSpace(os.Getenv("GOOGLE_REDIRECT_URI")),
 	}
 }
 
@@ -114,8 +128,26 @@ func (h *AuthHandler) RequestMagicLink(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	verifyURL := fmt.Sprintf("%s/auth/verify?token=%s", h.apiURL, url.QueryEscape(token))
-	if err := h.sendMagicLinkEmail(r.Context(), email, verifyURL); err != nil {
+	redirect := sanitizeRedirect(req.Redirect)
+	verifyURL, err := url.Parse(h.apiURL + "/auth/verify")
+	if err != nil {
+		http.Error(w, "Failed to create verify URL", http.StatusInternalServerError)
+		return
+	}
+	q := verifyURL.Query()
+	q.Set("token", token)
+	if redirect != "" {
+		q.Set("redirect", redirect)
+	}
+	verifyURL.RawQuery = q.Encode()
+
+	if err := h.sendMagicLinkEmail(r.Context(), email, verifyURL.String()); err != nil {
+		if !h.isProduction && errors.Is(err, ErrResendNotConfigured) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]string{"verifyUrl": verifyURL.String()})
+			return
+		}
 		http.Error(w, "Failed to send email", http.StatusBadGateway)
 		return
 	}
@@ -158,7 +190,7 @@ func (h *AuthHandler) VerifyMagicLink(w http.ResponseWriter, r *http.Request) {
 		Expires:  expiresAt,
 	})
 
-	http.Redirect(w, r, h.appURL, http.StatusFound)
+	http.Redirect(w, r, resolveAppRedirect(h.appURL, r.URL.Query().Get("redirect")), http.StatusFound)
 }
 
 func (h *AuthHandler) Me(w http.ResponseWriter, r *http.Request) {
@@ -202,7 +234,7 @@ func (h *AuthHandler) CurrentUser(r *http.Request) (*models.User, error) {
 
 func (h *AuthHandler) sendMagicLinkEmail(ctx context.Context, email, verifyURL string) error {
 	if h.resendAPIKey == "" || h.resendFrom == "" {
-		return errors.New("Resend not configured")
+		return ErrResendNotConfigured
 	}
 
 	payload := map[string]any{
@@ -251,6 +283,46 @@ func isValidEmail(email string) bool {
 	}
 	at := strings.Index(email, "@")
 	return at > 0 && at < len(email)-1
+}
+
+func sanitizeRedirect(raw string) string {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return ""
+	}
+	if strings.ContainsAny(value, "\r\n") {
+		return ""
+	}
+	parsed, err := url.Parse(value)
+	if err != nil {
+		return ""
+	}
+	if parsed.Scheme != "" || parsed.Host != "" || parsed.IsAbs() {
+		return ""
+	}
+	if parsed.Path == "" || !strings.HasPrefix(parsed.Path, "/") {
+		return ""
+	}
+	if strings.HasPrefix(parsed.Path, "//") {
+		return ""
+	}
+	return parsed.String()
+}
+
+func resolveAppRedirect(appURL string, redirect string) string {
+	redir := sanitizeRedirect(redirect)
+	if redir == "" {
+		return appURL
+	}
+	base, err := url.Parse(appURL)
+	if err != nil {
+		return strings.TrimRight(appURL, "/") + redir
+	}
+	rel, relErr := url.Parse(redir)
+	if relErr != nil {
+		return appURL
+	}
+	return base.ResolveReference(rel).String()
 }
 
 func generateToken() (string, error) {
