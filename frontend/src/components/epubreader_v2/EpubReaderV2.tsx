@@ -230,6 +230,54 @@ function variantStorageKey(bookId: string) {
   return `mfv2:epubreader_v2:variant:${bookId}`
 }
 
+function pendingTranslateStorageKey(bookId: string) {
+  return `mfv2:epubreader_v2:pendingTranslate:${bookId}`
+}
+
+function loadPendingTranslateVariants(bookId: string): TranslateVariant[] {
+  try {
+    if (typeof window === 'undefined' || typeof localStorage === 'undefined')
+      return []
+    const raw = localStorage.getItem(pendingTranslateStorageKey(bookId))
+    if (!raw) return []
+    const parsed = JSON.parse(raw)
+    if (!Array.isArray(parsed)) return []
+    return parsed
+      .map((v) => String(v ?? '').trim())
+      .filter((v): v is TranslateVariant => v.startsWith('translate_') && isReaderVariant(v))
+  } catch {
+    return []
+  }
+}
+
+function storePendingTranslateVariants(bookId: string, variants: TranslateVariant[]) {
+  try {
+    if (typeof window === 'undefined' || typeof localStorage === 'undefined')
+      return
+    const unique = Array.from(new Set(variants)).filter(
+      (v) => v.startsWith('translate_') && isReaderVariant(v),
+    )
+    localStorage.setItem(pendingTranslateStorageKey(bookId), JSON.stringify(unique))
+  } catch {
+    // ignore
+  }
+}
+
+function rememberPendingTranslateVariant(bookId: string, variant: TranslateVariant) {
+  const existing = loadPendingTranslateVariants(bookId)
+  if (existing.includes(variant)) return
+  storePendingTranslateVariants(bookId, [...existing, variant])
+}
+
+function forgetPendingTranslateVariant(bookId: string, variant: TranslateVariant) {
+  const existing = loadPendingTranslateVariants(bookId)
+  if (!existing.includes(variant)) return
+  storePendingTranslateVariants(
+    bookId,
+    existing.filter((v) => v !== variant),
+  )
+}
+
 function loadStoredVariant(bookId: string): ReaderVariant | null {
   try {
     if (typeof window === 'undefined' || typeof localStorage === 'undefined')
@@ -514,22 +562,27 @@ const EpubReaderV2Inner = forwardRef<
 
   const [transformStatuses, setTransformStatuses] = useState<
     Record<string, TransformStatus | null>
-  >({})
+  >(() => {
+    const bookId = String(baseStorageId ?? '').trim()
+    if (!bookId) return {}
+    const pending = loadPendingTranslateVariants(bookId)
+    if (pending.length === 0) return {}
+
+    const optimisticNow = new Date().toISOString()
+    const initial: Record<string, TransformStatus> = {}
+    for (const key of pending) {
+      initial[key] = {
+        status: 'pending',
+        dest_key: '',
+        created_at: optimisticNow,
+        updated_at: optimisticNow,
+      }
+    }
+    return initial
+  })
   const transformStatusesRef = useRef(transformStatuses)
   transformStatusesRef.current = transformStatuses
   const transformStartInFlightRef = useRef<Record<string, boolean>>({})
-  const transformIdentityRef = useRef<string>('')
-
-  useEffect(() => {
-    // Ensure transform state doesn't leak across book switches if this component instance is reused.
-    const identity = `${baseStorageId}|${bookUrl}`
-    if (transformIdentityRef.current === identity) return
-    transformIdentityRef.current = identity
-    setTransformStatuses({})
-    transformStartInFlightRef.current = {}
-    setTranslateLangDraft('')
-    setTranslateLangError(null)
-  }, [baseStorageId, bookUrl])
 
   const resolvedVariantUrl = useMemo(() => {
     if (variant === 'original') return ''
@@ -625,6 +678,12 @@ const EpubReaderV2Inner = forwardRef<
             next[r.key] = mergeTransformStatus(prev[r.key], r.status)
           return next
         })
+        for (const r of results) {
+          if (!r.key.startsWith('translate_')) continue
+          if (r.status.status === 'pending' || r.status.status === 'running')
+            continue
+          forgetPendingTranslateVariant(bookId, r.key as TranslateVariant)
+        }
         const stillRunning = runningKeys.some((key) => {
           const status =
             mergedByKey.get(key) ?? transformStatusesRef.current[key]
@@ -864,6 +923,7 @@ const EpubReaderV2Inner = forwardRef<
 
       setTranslateLangError(null)
       const key = translateVariantKeyFromLang(normalizedLang) as ReaderVariant
+      rememberPendingTranslateVariant(bookId, key as TranslateVariant)
       if (transformStartInFlightRef.current[key]) return
       transformStartInFlightRef.current[key] = true
       // Optimistically mark as running so the UI reacts immediately.
@@ -886,6 +946,9 @@ const EpubReaderV2Inner = forwardRef<
           ...prev,
           [key]: mergeTransformStatus(prev[key], status),
         }))
+        if (status.status !== 'pending' && status.status !== 'running') {
+          forgetPendingTranslateVariant(bookId, key as TranslateVariant)
+        }
         if (status.status === 'error') {
           showToast(
             `Translate failed: ${status.error ?? 'Unknown error'}`,
@@ -896,6 +959,7 @@ const EpubReaderV2Inner = forwardRef<
         const message =
           err instanceof Error ? err.message : 'Failed to start transform'
         showToast(`Translate failed: ${message}`, 'error')
+        forgetPendingTranslateVariant(bookId, key as TranslateVariant)
         setTransformStatuses((prev) => ({
           ...prev,
           [key]: { status: 'error', dest_key: '', error: message },
@@ -2834,6 +2898,17 @@ const EpubReaderV2Inner = forwardRef<
     : 'rgba(255, 255, 255, 0.95)'
   const panelBorder = isDark ? 'rgba(255,255,255,0.1)' : 'rgba(0,0,0,0.1)'
 
+  const translateDraftVariant = useMemo(() => {
+    const normalized = normalizeTranslateLangInput(translateLangDraft)
+    return normalized ? translateVariantKeyFromLang(normalized) : null
+  }, [translateLangDraft])
+
+  const translateDraftBusy = useMemo(() => {
+    if (!translateDraftVariant) return false
+    const s = transformStatuses[translateDraftVariant]?.status ?? null
+    return s === 'pending' || s === 'running'
+  }, [translateDraftVariant, transformStatuses])
+
   return (
     <div
       ref={containerRef}
@@ -3866,6 +3941,56 @@ const EpubReaderV2Inner = forwardRef<
                   transformationData?.[key]?.[0] ?? '',
                 ).trim()
                 const available = Boolean(fromStatus || fromBook)
+                const translateStatus = transformStatuses[key]?.status ?? null
+                const translateBusy =
+                  translateStatus === 'pending' || translateStatus === 'running'
+                const translateError =
+                  translateStatus === 'error'
+                    ? String(transformStatuses[key]?.error ?? '').trim()
+                    : ''
+
+                if (!available) {
+                  return (
+                    <div
+                      key={key}
+                      className="h-10 hover:bg-transparent px-3 w-full flex justify-between items-center"
+                      title={
+                        translateBusy
+                          ? 'Translating…'
+                          : translateError
+                            ? translateError
+                            : 'Translation not ready yet'
+                      }
+                    >
+                      <span className="mfv2-reader__versionOptionText">
+                        {variantLabel(key)}
+                      </span>
+                      <button
+                        className="mfv2-reader__versionMetaButton"
+                        type="button"
+                        disabled={translateBusy}
+                        onClick={() => {
+                          void startTranslate(langFromTranslateVariant(key))
+                        }}
+                        title={
+                          translateBusy
+                            ? 'Translating…'
+                            : translateError
+                              ? 'Retry translation'
+                              : 'Create translation'
+                        }
+                      >
+                        {translateBusy ? (
+                          <Loader2 className="w-4 h-4 animate-spin" />
+                        ) : translateError ? (
+                          'Retry'
+                        ) : (
+                          'Create'
+                        )}
+                      </button>
+                    </div>
+                  )
+                }
 
                 return (
                   <button
@@ -3909,12 +4034,16 @@ const EpubReaderV2Inner = forwardRef<
                     <button
                       className="mfv2-reader__versionMetaButton"
                       type="button"
-                      disabled={!translateLangDraft.trim()}
+                      disabled={!translateLangDraft.trim() || translateDraftBusy}
                       onClick={() => {
                         void startTranslate(translateLangDraft)
                       }}
                     >
-                      Create
+                      {translateDraftBusy ? (
+                        <Loader2 className="w-4 h-4 animate-spin" />
+                      ) : (
+                        'Create'
+                      )}
                     </button>
                   </div>
                   {translateLangError && (
