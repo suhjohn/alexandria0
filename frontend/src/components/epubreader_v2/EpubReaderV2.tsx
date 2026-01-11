@@ -62,6 +62,10 @@ export type EpubReaderV2Handle = {
     chapterTotalPages: number
     text: string
   } | null
+  getSpineItemText: (options: {
+    spineIndex: number
+    maxChars?: number
+  }) => Promise<string | null>
 }
 
 export type EpubReaderV2Status =
@@ -199,6 +203,43 @@ function extractVisibleText(options: {
     push(el.innerText || el.textContent || '')
   }
   return pieces.join('\n').slice(0, maxChars).trim()
+}
+
+function extractSpineItemText(options: {
+  xhtmlText: string
+  maxChars: number
+}): string {
+  const { xhtmlText, maxChars } = options
+  const parser = new DOMParser()
+  const doc = parser.parseFromString(String(xhtmlText ?? ''), 'text/html')
+  const root = doc.body ?? doc.documentElement
+  const candidates = Array.from(
+    root.querySelectorAll('h1,h2,h3,h4,h5,h6,p,li,blockquote,pre'),
+  ) as HTMLElement[]
+
+  const pieces: string[] = []
+  let used = 0
+
+  const push = (raw: string) => {
+    const cleaned = normalizeVisibleText(raw)
+    if (!cleaned) return
+    if (used >= maxChars) return
+    if (used + cleaned.length > maxChars) {
+      const remain = Math.max(0, maxChars - used)
+      if (remain > 24) pieces.push(`${cleaned.slice(0, remain)}…`)
+      used = maxChars
+      return
+    }
+    pieces.push(cleaned)
+    used += cleaned.length + 2
+  }
+
+  for (const el of candidates) {
+    if (used >= maxChars) break
+    push(el.textContent || '')
+  }
+
+  return pieces.join('\n\n').slice(0, maxChars).trim()
 }
 
 function storageKey(bookId: string) {
@@ -886,7 +927,7 @@ const EpubReaderV2Inner = forwardRef<
     return { spineIndex: currentSpineIndex, chapterProgress }
   }, [spineIndex])
 
-  const startModernify = useCallback(async () => {
+  const startModernify = useCallback(async (options?: { force?: boolean }) => {
     const bookId = baseStorageId
     if (!bookId) return
     const key: ReaderVariant = 'modernify'
@@ -904,7 +945,11 @@ const EpubReaderV2Inner = forwardRef<
       },
     }))
     try {
-      const status = await startBookTransform(bookId, { type: 'modernify' })
+      const force = Boolean(options?.force)
+      const status = await startBookTransform(bookId, {
+        type: 'modernify',
+        ...(force ? { force: true } : {}),
+      })
       setTransformStatuses((prev) => ({
         ...prev,
         [key]: mergeTransformStatus(prev[key], status),
@@ -1606,7 +1651,7 @@ const EpubReaderV2Inner = forwardRef<
           layout,
           flowMode,
           pageIndex,
-          maxChars: 2400,
+          maxChars: 8000,
         })
 
         return {
@@ -1615,6 +1660,29 @@ const EpubReaderV2Inner = forwardRef<
           pageIndex,
           chapterTotalPages,
           text,
+        }
+      },
+      getSpineItemText: async (options) => {
+        const pub = publicationRef.current
+        const store = resourceStoreRef.current
+        if (!pub || !store) return null
+
+        const spineIndex = clamp(
+          Number(options?.spineIndex ?? 0),
+          0,
+          Math.max(0, pub.spine.length - 1),
+        )
+        const href = String(pub.spine[spineIndex]?.href ?? '').trim()
+        if (!href) return null
+
+        try {
+          const xhtmlText = await store.readText(href)
+          return extractSpineItemText({
+            xhtmlText,
+            maxChars: Math.max(1, Number(options?.maxChars ?? 18_000)),
+          })
+        } catch {
+          return null
         }
       },
     }),
@@ -2878,8 +2946,10 @@ const EpubReaderV2Inner = forwardRef<
   useEffect(() => {
     setModernifyStuck(false)
     if (!modernifyBusy) return
+    const updatedAt = transformStatuses.modernify?.updated_at
     const createdAt = transformStatuses.modernify?.created_at
-    const startedAt = createdAt ? Date.parse(createdAt) : NaN
+    const startedAtRaw = updatedAt || createdAt
+    const startedAt = startedAtRaw ? Date.parse(startedAtRaw) : NaN
     if (!Number.isFinite(startedAt)) return
     const thresholdMs = 5 * 60 * 1000
     const remaining = startedAt + thresholdMs - Date.now()
@@ -2889,7 +2959,11 @@ const EpubReaderV2Inner = forwardRef<
     }
     const timer = window.setTimeout(() => setModernifyStuck(true), remaining)
     return () => window.clearTimeout(timer)
-  }, [modernifyBusy, transformStatuses.modernify?.created_at])
+  }, [
+    modernifyBusy,
+    transformStatuses.modernify?.updated_at,
+    transformStatuses.modernify?.created_at,
+  ])
 
   const translateVariants = useMemo(() => {
     const out = new Set<string>()
@@ -3935,7 +4009,9 @@ const EpubReaderV2Inner = forwardRef<
                           : modernifyError || 'Create a modernified version'
                     }
                     onClick={() => {
-                      void startModernify()
+                      void startModernify({
+                        force: modernifyBusy && modernifyStuck,
+                      })
                     }}
                   >
                     {modernifyBusy && modernifyStuck ? (

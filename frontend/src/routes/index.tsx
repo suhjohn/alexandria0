@@ -404,6 +404,11 @@ function App() {
     () => readerRef.current?.getVisiblePage?.() ?? null,
     [],
   )
+  const getSpineItemText = useCallback(
+    (options: { spineIndex: number; maxChars?: number }) =>
+      readerRef.current?.getSpineItemText(options) ?? Promise.resolve(null),
+    [],
+  )
 
   const createInsertId = () => {
     if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) {
@@ -1669,6 +1674,7 @@ function App() {
                   : null
               }
               getCurrentReaderPage={getCurrentReaderPage}
+              getSpineItemText={getSpineItemText}
             />
           </ResizableWindow>
         </div>

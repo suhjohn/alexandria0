@@ -118,10 +118,17 @@ export async function uploadBook(options: {
 
 export const startBookTransform = async (
   bookId: string,
-  arg?: string | { type?: TransformType; lang?: string; prompt?: string },
+  arg?:
+    | string
+    | {
+        type?: TransformType
+        lang?: string
+        prompt?: string
+        force?: boolean
+      },
 ): Promise<TransformStatus> => {
   const options = typeof arg === 'string' ? { prompt: arg } : (arg ?? {})
-  const { type, lang, prompt } = options
+  const { type, lang, prompt, force } = options
   const response = await fetch(`${apiBase()}/books/${bookId}/transform`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -130,6 +137,7 @@ export const startBookTransform = async (
       ...(type ? { type } : {}),
       ...(lang ? { lang } : {}),
       ...(prompt ? { prompt } : {}),
+      ...(force ? { force: true } : {}),
     }),
   })
 

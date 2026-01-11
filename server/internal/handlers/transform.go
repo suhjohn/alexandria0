@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -34,6 +35,7 @@ type startTransformRequest struct {
 	Type   string `json:"type,omitempty"`
 	Lang   string `json:"lang,omitempty"`
 	Prompt string `json:"prompt,omitempty"`
+	Force  bool   `json:"force,omitempty"`
 }
 
 type transformRequest struct {
@@ -113,6 +115,12 @@ func (h *BookTransformHandler) StartTransform(w http.ResponseWriter, r *http.Req
 		reqVariant = strings.TrimSpace(r.URL.Query().Get("variant"))
 	}
 	reqLang := strings.TrimSpace(r.URL.Query().Get("lang"))
+	force := false
+	if rawForce := strings.TrimSpace(r.URL.Query().Get("force")); rawForce != "" {
+		if parsed, err := strconv.ParseBool(rawForce); err == nil {
+			force = parsed
+		}
+	}
 
 	var req startTransformRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
@@ -124,6 +132,9 @@ func (h *BookTransformHandler) StartTransform(w http.ResponseWriter, r *http.Req
 	}
 	if strings.TrimSpace(reqLang) == "" {
 		reqLang = strings.TrimSpace(req.Lang)
+	}
+	if !force && req.Force {
+		force = true
 	}
 
 	variantKey, variantErr := parseTransformVariantKey(reqVariant, reqLang)
@@ -156,7 +167,7 @@ func (h *BookTransformHandler) StartTransform(w http.ResponseWriter, r *http.Req
 	destKey := transformDestKey(book.ID, sourceKey, variantKey)
 
 	job, err := h.jobRepo.GetByBookVariant(r.Context(), book.ID, variantKey)
-	if err == nil && job != nil && (job.Status == "pending" || job.Status == "running") {
+	if !force && err == nil && job != nil && (job.Status == "pending" || job.Status == "running") {
 		jobDestKey := job.DestKey
 		if strings.TrimSpace(jobDestKey) == "" {
 			jobDestKey = destKey

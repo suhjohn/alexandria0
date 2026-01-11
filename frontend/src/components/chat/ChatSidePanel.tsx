@@ -3,7 +3,7 @@ import { createRoot, type Root } from 'react-dom/client'
 import { createGoogleGenerativeAI } from '@ai-sdk/google'
 import Placeholder from '@tiptap/extension-placeholder'
 import Mention from '@tiptap/extension-mention'
-import { Extension } from '@tiptap/core'
+import { Extension, Node as TiptapNode } from '@tiptap/core'
 import {
   EditorContent,
   NodeViewWrapper,
@@ -12,7 +12,7 @@ import {
   useEditor,
 } from '@tiptap/react'
 import StarterKit from '@tiptap/starter-kit'
-import { streamText, type ModelMessage } from 'ai'
+import { streamText, type ImagePart, type ModelMessage, type TextPart } from 'ai'
 import {
   ArrowUp,
   Check,
@@ -20,6 +20,7 @@ import {
   ChevronRight,
   Clock,
   Copy,
+  Image as ImageIcon,
   Plus,
   RotateCcw,
   Trash2,
@@ -96,6 +97,14 @@ type BookRefAttrs = {
   endIndex?: number | null
   selectedText?: string | null
   spineIndex?: number | null
+}
+
+type ChatImageAttrs = {
+  id?: string | null
+  filename?: string | null
+  mediaType?: string | null
+  dataBase64?: string | null
+  sizeBytes?: number | null
 }
 
 type BookRefNavigatePayload =
@@ -213,10 +222,40 @@ function currentVisiblePageSystemPrompt(page: CurrentReaderPage | null): string 
     href ? `Href: ${truncateSnippet(href, 180)}` : undefined,
     `SpineIndex: ${page.spineIndex}`,
     pageLabel,
-    text ? `Text:\n${truncateSnippet(text, 2200)}` : undefined,
+    text ? `Text:\n${truncateSnippet(text, 8000)}` : undefined,
   ].filter(Boolean) as string[]
 
   return lines.join('\n').trim()
+}
+
+function visitTiptapDoc(
+  node: any,
+  visit: (n: any) => void,
+): void {
+  if (!node || typeof node !== 'object') return
+  visit(node)
+  const content = Array.isArray(node.content) ? node.content : []
+  for (const child of content) visitTiptapDoc(child, visit)
+}
+
+function extractBookRefsFromDoc(doc: TiptapDoc): Array<BookRefAttrs> {
+  const refs: Array<BookRefAttrs> = []
+  visitTiptapDoc(doc, (n) => {
+    if (n?.type !== 'bookRef') return
+    const attrs = (n.attrs ?? {}) as BookRefAttrs
+    refs.push(attrs)
+  })
+  return refs
+}
+
+function extractChatImagesFromDoc(doc: TiptapDoc): Array<ChatImageAttrs> {
+  const imgs: Array<ChatImageAttrs> = []
+  visitTiptapDoc(doc, (n) => {
+    if (n?.type !== 'chatImage') return
+    const attrs = (n.attrs ?? {}) as ChatImageAttrs
+    imgs.push(attrs)
+  })
+  return imgs
 }
 
 function toModelMessages(
@@ -226,7 +265,32 @@ function toModelMessages(
   const prompt = String(systemPrompt ?? '').trim()
   const base = messages
     .filter((m) => m.role === 'user' || m.role === 'assistant')
-    .map((m) => ({ role: m.role, content: m.content }))
+    .map((m) => {
+      if (m.role !== 'user') {
+        return { role: m.role, content: m.content }
+      }
+
+      const doc = parseTiptapDoc(m.contentJson ?? null, m.content)
+      const images = extractChatImagesFromDoc(doc).filter(
+        (img) => Boolean(String(img.dataBase64 ?? '').trim()) && Boolean(String(img.mediaType ?? '').trim()),
+      )
+
+      if (images.length === 0) {
+        return { role: m.role, content: m.content }
+      }
+
+      const parts: Array<TextPart | ImagePart> = []
+      const text = String(m.content ?? '')
+      if (text.trim()) parts.push({ type: 'text', text })
+      for (const img of images) {
+        parts.push({
+          type: 'image',
+          image: String(img.dataBase64 ?? ''),
+          mediaType: String(img.mediaType ?? '') || undefined,
+        })
+      }
+      return { role: m.role, content: parts }
+    })
 
   if (!prompt) return base
   return [{ role: 'system', content: prompt }, ...base]
@@ -382,6 +446,36 @@ const BookRefMention = (Mention as any).extend({
   },
 })
 
+const ChatImageNode = TiptapNode.create({
+  name: 'chatImage',
+  group: 'inline',
+  inline: true,
+  atom: true,
+  selectable: true,
+  addAttributes() {
+    return {
+      id: { default: null },
+      filename: { default: null },
+      mediaType: { default: null },
+      dataBase64: { default: null },
+      sizeBytes: { default: null },
+    }
+  },
+  parseHTML() {
+    return [{ tag: 'span[data-chat-image]' }]
+  },
+  renderText({ node }: { node: any }) {
+    const filename = String(node?.attrs?.filename ?? '').trim()
+    return filename ? `[Image: ${filename}]` : '[Image]'
+  },
+  renderHTML({ HTMLAttributes }: { HTMLAttributes: Record<string, any> }) {
+    return ['span', { ...HTMLAttributes, 'data-chat-image': '1' }]
+  },
+  addNodeView() {
+    return ReactNodeViewRenderer(ChatImageNodeView)
+  },
+})
+
 function BookRefNodeView(props: ReactNodeViewProps) {
   const attrs = (props.node.attrs ?? {}) as BookRefAttrs
   const bookTitle = String(attrs.bookTitle ?? '').trim() || 'Book'
@@ -435,6 +529,14 @@ function BookRefNodeView(props: ReactNodeViewProps) {
     const href = String(attrs.href ?? '')
     const spineIndex = Number(attrs.spineIndex)
     const textOffset = Number(attrs.startIndex ?? 0)
+
+    // Prefer href navigation when we have an explicit fragment; otherwise we'd
+    // drop the anchor and jump to the start of the spine item.
+    if (hasHref && href.includes('#')) {
+      debugChatMentions('chip:navigate:href', { bookId, href })
+      onNavigate?.({ bookId, href })
+      return
+    }
 
     // Prefer offset navigation because it reliably loads the correct spine,
     // even if href resolution fails.
@@ -513,6 +615,61 @@ function BookRefNodeView(props: ReactNodeViewProps) {
   )
 }
 
+function ChatImageNodeView(props: ReactNodeViewProps) {
+  const attrs = (props.node.attrs ?? {}) as ChatImageAttrs
+  const filename = String(attrs.filename ?? '').trim() || 'image'
+  const mediaType = String(attrs.mediaType ?? '').trim()
+  const dataBase64 = String(attrs.dataBase64 ?? '').trim()
+  const canPreview = Boolean(mediaType && dataBase64)
+  const previewSrc = canPreview ? `data:${mediaType};base64,${dataBase64}` : ''
+
+  return (
+    <NodeViewWrapper as="span">
+      <HoverCard openDelay={250}>
+        <HoverCardTrigger asChild>
+          <span
+            contentEditable={false}
+            className={cn(
+              'inline-flex max-w-full items-center gap-1.5 rounded-lg border px-2 py-1 text-[12px] leading-tight shadow-sm',
+              'bg-[color:var(--paper)] border-[color:var(--accent-soft)] text-[color:var(--accent)]',
+              'select-none',
+            )}
+            title={filename}
+          >
+            <ImageIcon className="h-3.5 w-3.5 text-[color:var(--ink)]/60" />
+            <span className="min-w-0 max-w-[220px] truncate font-semibold text-[color:var(--ink)]/80">
+              {filename}
+            </span>
+          </span>
+        </HoverCardTrigger>
+        <HoverCardContent
+          side="top"
+          align="start"
+          sideOffset={8}
+          className="w-[min(520px,calc(100vw-32px))] border-[color:var(--accent-soft)] bg-[color:var(--paper)] text-[color:var(--ink)]"
+        >
+          <div className="text-[10px] text-[color:var(--ink)]/60">
+            {filename}
+          </div>
+          {canPreview ? (
+            <div className="mt-2 max-h-56 overflow-auto rounded-md border border-[color:var(--accent-soft)] bg-[color:var(--paper-deep)] p-2">
+              <img
+                src={previewSrc}
+                alt={filename}
+                className="max-h-52 w-auto max-w-full rounded"
+              />
+            </div>
+          ) : (
+            <div className="mt-2 text-xs text-[color:var(--ink)]/60">
+              (No preview available)
+            </div>
+          )}
+        </HoverCardContent>
+      </HoverCard>
+    </NodeViewWrapper>
+  )
+}
+
 function ChatComposer(props: {
   mode: 'new' | 'edit'
   initialDoc: TiptapDoc
@@ -557,6 +714,8 @@ function ChatComposer(props: {
     () => createChapterSuggestionRenderer,
     [],
   )
+
+  const fileInputRef = React.useRef<HTMLInputElement | null>(null)
 
   const editor = useEditor(
     {
@@ -640,6 +799,7 @@ function ChatComposer(props: {
             return ['span', htmlAttrs, bookRefDisplayLabel(node.attrs ?? {})]
           },
         }),
+        ChatImageNode,
         StarterKit.configure({
           bold: false,
           heading: false,
@@ -701,6 +861,59 @@ function ChatComposer(props: {
     [props.placeholder],
   )
 
+  const handleAttachImageClick = () => {
+    if (props.disabled) return
+    fileInputRef.current?.click()
+  }
+
+  const handleImageFiles = async (files: FileList | null) => {
+    if (!editor) return
+    if (props.disabled) return
+    if (!files || files.length === 0) return
+
+    const accepted = Array.from(files).filter((f) =>
+      String(f.type ?? '').toLowerCase().startsWith('image/'),
+    )
+    if (accepted.length === 0) return
+
+    const readAsDataUrl = (file: File) =>
+      new Promise<string>((resolve, reject) => {
+        const reader = new FileReader()
+        reader.onload = () => resolve(String(reader.result ?? ''))
+        reader.onerror = () => reject(reader.error ?? new Error('Read failed'))
+        reader.readAsDataURL(file)
+      })
+
+    for (const file of accepted) {
+      try {
+        const dataUrl = await readAsDataUrl(file)
+        const match = /^data:([^;]+);base64,(.+)$/i.exec(dataUrl)
+        if (!match) continue
+        const mediaType = match[1] ?? ''
+        const dataBase64 = match[2] ?? ''
+        if (!mediaType || !dataBase64) continue
+
+        editor
+          .chain()
+          .focus()
+          .insertContent({
+            type: 'chatImage',
+            attrs: {
+              id: createId(),
+              filename: file.name,
+              mediaType,
+              dataBase64,
+              sizeBytes: file.size,
+            } satisfies ChatImageAttrs,
+          })
+          .insertContent(' ')
+          .run()
+      } catch {
+        // ignore
+      }
+    }
+  }
+
   React.useEffect(() => {
     if (!editor) return
     if (props.disabled) return
@@ -749,6 +962,17 @@ function ChatComposer(props: {
         props.disabled && 'opacity-60',
       )}
     >
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept="image/*"
+        multiple
+        className="hidden"
+        onChange={(e) => {
+          void handleImageFiles(e.currentTarget.files)
+          e.currentTarget.value = ''
+        }}
+      />
       <style>{`
         .mfv2-chatComposer .ProseMirror {
           outline: none;
@@ -772,6 +996,20 @@ function ChatComposer(props: {
       </div>
 
       <div className="flex items-center justify-end gap-2 px-2.5 pb-2">
+        <button
+          type="button"
+          onClick={handleAttachImageClick}
+          disabled={props.disabled}
+          className={cn(
+            'rounded-full bg-[color:var(--accent-soft)] cursor-pointer p-1.5 transition-colors',
+            'hover:bg-[color:var(--paper-deep)]',
+            'disabled:cursor-not-allowed disabled:opacity-50',
+          )}
+          aria-label="Attach image"
+          title="Attach image"
+        >
+          <ImageIcon className="w-4 h-4 text-[color:var(--ink)]/70" />
+        </button>
         {props.isStreaming ? (
           <button
             type="button"
@@ -835,6 +1073,7 @@ function ChatMessageRichContent(props: {
             return ['span', htmlAttrs, bookRefDisplayLabel(node.attrs ?? {})]
           },
         }),
+        ChatImageNode,
         StarterKit.configure({
           bold: false,
           heading: false,
@@ -903,6 +1142,10 @@ export function ChatSidePanel(
     chapterSuggestions?: Array<ChapterSuggestion>
     currentBook?: CurrentBookInfo | null
     getCurrentReaderPage?: () => CurrentReaderPage | null
+    getSpineItemText?: (options: {
+      spineIndex: number
+      maxChars?: number
+    }) => Promise<string | null>
   } = {},
 ) {
   const isMac = React.useMemo(() => isMacPlatform(), [])
@@ -957,13 +1200,76 @@ export function ChatSidePanel(
     [conversations, selectedConversationId],
   )
 
-  const buildSystemPrompt = () => {
+  const docHasImages = React.useCallback((doc: TiptapDoc) => {
+    return extractChatImagesFromDoc(doc).some(
+      (img) => Boolean(String(img.dataBase64 ?? '').trim()),
+    )
+  }, [])
+
+  const buildSystemPrompt = async (promptMessages: Array<ChatMessage>) => {
     const pagePrompt = currentVisiblePageSystemPrompt(
       props.getCurrentReaderPage?.() ?? null,
     )
-    return [currentBookSystemPrompt(props.currentBook ?? null), pagePrompt]
+    const base = [currentBookSystemPrompt(props.currentBook ?? null), pagePrompt]
       .filter(Boolean)
-      .join('\n\n')
+
+    const refsByKey = new Map<string, BookRefAttrs>()
+    for (const msg of promptMessages) {
+      if (msg.role !== 'user') continue
+      const doc = parseTiptapDoc(msg.contentJson ?? null, msg.content)
+      for (const ref of extractBookRefsFromDoc(doc)) {
+        const bookId = String(ref.bookId ?? '').trim()
+        const spineIndex = Number(ref.spineIndex ?? NaN)
+        const href = String(ref.href ?? '').trim()
+        const chapterTitle = String(ref.chapterTitle ?? '').trim()
+        const key = `${bookId}:${Number.isFinite(spineIndex) ? spineIndex : ''}:${href}:${chapterTitle}`
+        if (!refsByKey.has(key)) refsByKey.set(key, ref)
+      }
+    }
+
+    const refs = Array.from(refsByKey.values())
+    if (refs.length === 0) return base.join('\n\n')
+
+    const chunks: string[] = []
+    const currentBookId = String(props.currentBook?.bookId ?? '').trim()
+    const excerpts = await Promise.all(
+      refs.map(async (ref) => {
+        const selectedText = String(ref.selectedText ?? '').trim()
+        if (selectedText) return selectedText
+        const bookId = String(ref.bookId ?? '').trim()
+        if (bookId && currentBookId && bookId !== currentBookId) return ''
+        const spineIndex = Number(ref.spineIndex ?? NaN)
+        if (!Number.isFinite(spineIndex) || !props.getSpineItemText) return ''
+        return (await props.getSpineItemText({ spineIndex, maxChars: 18_000 })) ?? ''
+      }),
+    )
+
+    for (let i = 0; i < refs.length; i++) {
+      const ref = refs[i]
+      const excerpt = String(excerpts[i] ?? '').trim()
+      if (!excerpt) continue
+
+      const bookTitle = String(ref.bookTitle ?? '').trim() || 'Book'
+      const chapterTitle = String(ref.chapterTitle ?? '').trim()
+      const spineIndex = Number(ref.spineIndex ?? NaN)
+      const href = String(ref.href ?? '').trim()
+
+      const headerLines: string[] = [
+        `Book: ${truncateSnippet(bookTitle, 120)}`,
+        chapterTitle ? `Chapter: ${truncateSnippet(chapterTitle, 180)}` : undefined,
+        href ? `Href: ${truncateSnippet(href, 180)}` : undefined,
+        Number.isFinite(spineIndex) ? `SpineIndex: ${spineIndex}` : undefined,
+      ].filter(Boolean) as string[]
+
+      chunks.push(
+        `${headerLines.join('\n')}\nText:\n${truncateSnippet(excerpt, 18_000)}`,
+      )
+    }
+
+    if (chunks.length === 0) return base.join('\n\n')
+    return [...base, `Referenced text:\n\n${chunks.join('\n\n---\n\n')}`].join(
+      '\n\n',
+    )
   }
 
   const setScrollPinned = React.useCallback((next: boolean) => {
@@ -1398,7 +1704,8 @@ export function ChatSidePanel(
   const saveEditMessage = async () => {
     if (!editingMessageId) return
     const nextText = editText.trim()
-    if (!nextText) return
+    const hasImages = docHasImages(editDoc)
+    if (!nextText && !hasImages) return
 
     const conversationId =
       selectedConversationId ?? (await ensureConversationSelected())
@@ -1459,7 +1766,7 @@ export function ChatSidePanel(
       db.setActiveMessageId(conversationId, newUserMessage.id)
 
       const provider = createGoogleGenerativeAI({ apiKey: storedKey })
-      const systemPrompt = buildSystemPrompt()
+      const systemPrompt = await buildSystemPrompt([...baseMessages, newUserMessage])
       const promptMessages = toModelMessages(
         [...baseMessages, newUserMessage],
         systemPrompt,
@@ -1573,7 +1880,7 @@ export function ChatSidePanel(
     try {
       const db = await getChatDb()
       const provider = createGoogleGenerativeAI({ apiKey: storedKey })
-      const systemPrompt = buildSystemPrompt()
+      const systemPrompt = await buildSystemPrompt(baseMessages)
       const promptMessages = toModelMessages(baseMessages, systemPrompt)
 
       setIsStreaming(true)
@@ -1719,7 +2026,8 @@ export function ChatSidePanel(
 
   const sendMessage = async () => {
     const text = draftText.trim()
-    if (!text) return
+    const hasImages = docHasImages(draftDoc)
+    if (!text && !hasImages) return
     const conversationId =
       selectedConversationId ?? (await ensureConversationSelected())
 
@@ -1782,7 +2090,7 @@ export function ChatSidePanel(
       db.setActiveMessageId(conversationId, userMessage.id)
 
       const provider = createGoogleGenerativeAI({ apiKey: storedKey })
-      const systemPrompt = buildSystemPrompt()
+      const systemPrompt = await buildSystemPrompt([...baseMessages, userMessage])
       const promptMessages = toModelMessages(
         [...baseMessages, userMessage],
         systemPrompt,
@@ -2043,7 +2351,9 @@ export function ChatSidePanel(
                           onNavigateBookRef={props.onNavigateBookRef}
                           chapterSuggestions={props.chapterSuggestions ?? []}
                           currentBook={props.currentBook ?? null}
-                          canSubmit={Boolean(editText.trim())}
+                          canSubmit={
+                            Boolean(editText.trim()) || docHasImages(editDoc)
+                          }
                           isStreaming={isStreaming}
                           onStopStreaming={stopStreaming}
                           onSubmit={() => void saveEditMessage()}
@@ -2324,7 +2634,7 @@ export function ChatSidePanel(
           onNavigateBookRef={props.onNavigateBookRef}
           chapterSuggestions={props.chapterSuggestions ?? []}
           currentBook={props.currentBook ?? null}
-          canSubmit={Boolean(draftText.trim())}
+          canSubmit={Boolean(draftText.trim()) || docHasImages(draftDoc)}
           isStreaming={isStreaming}
           onStopStreaming={stopStreaming}
           onSubmit={() => void sendMessage()}
