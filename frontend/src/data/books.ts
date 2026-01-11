@@ -36,6 +36,16 @@ function apiBase() {
   return import.meta.env.VITE_API_URL || defaultApiUrl
 }
 
+export function getBookFileUrl(
+  bookId: string,
+  options?: { variant?: string },
+): string {
+  const base = apiBase()
+  const variant = String(options?.variant ?? '').trim()
+  const suffix = variant ? `?variant=${encodeURIComponent(variant)}` : ''
+  return `${base}/books/${encodeURIComponent(bookId)}/file${suffix}`
+}
+
 export const getBooks = createServerFn({
   method: 'GET',
 }).handler(async (): Promise<Book[]> => {
@@ -82,6 +92,26 @@ export async function getBook(bookId: string): Promise<Book | null> {
   if (response.status === 404) return null
   if (!response.ok) {
     throw new Error('Failed to fetch book')
+  }
+  return response.json()
+}
+
+export async function uploadBook(options: {
+  file: File
+  title?: string
+}): Promise<Book> {
+  const form = new FormData()
+  form.set('file', options.file)
+  if (options.title) form.set('title', options.title)
+
+  const response = await fetch(`${apiBase()}/books/upload`, {
+    method: 'POST',
+    credentials: 'include',
+    body: form,
+  })
+  if (!response.ok) {
+    const text = await response.text().catch(() => '')
+    throw new Error(text || 'Failed to upload book')
   }
   return response.json()
 }

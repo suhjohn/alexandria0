@@ -12,6 +12,7 @@ export interface FetchOptions {
   onProgress?: (progress: FetchProgress) => void
   signal?: AbortSignal
   useRangeRequests?: boolean
+  credentials?: RequestCredentials
   retries?: number
   retryDelay?: number
 }
@@ -32,6 +33,7 @@ export class EpubFetcher {
   async fetch(url: string, options: FetchOptions = {}): Promise<FetchResult> {
     const {
       headers = {},
+      credentials = 'same-origin',
       onProgress,
       signal,
       retries = DEFAULT_RETRY_COUNT,
@@ -49,7 +51,13 @@ export class EpubFetcher {
 
     for (let attempt = 0; attempt <= retries; attempt++) {
       try {
-        const result = await this.fetchWithProgress(url, headers, onProgress, signal)
+        const result = await this.fetchWithProgress(
+          url,
+          headers,
+          credentials,
+          onProgress,
+          signal,
+        )
         this.cache.set(url, result)
         return result
       } catch (error) {
@@ -71,13 +79,14 @@ export class EpubFetcher {
   private async fetchWithProgress(
     url: string,
     headers: Record<string, string>,
+    credentials: RequestCredentials,
     onProgress?: (progress: FetchProgress) => void,
     signal?: AbortSignal
   ): Promise<FetchResult> {
     const response = await fetch(url, {
       headers,
       signal,
-      credentials: 'same-origin',
+      credentials,
     })
 
     if (!response.ok) {
@@ -124,13 +133,15 @@ export class EpubFetcher {
     url: string,
     start: number,
     end: number,
-    headers: Record<string, string> = {}
+    headers: Record<string, string> = {},
+    credentials: RequestCredentials = 'same-origin'
   ): Promise<ArrayBuffer> {
     const response = await fetch(url, {
       headers: {
         ...headers,
         Range: `bytes=${start}-${end}`,
       },
+      credentials,
     })
 
     if (response.status !== 206 && response.status !== 200) {

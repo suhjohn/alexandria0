@@ -234,6 +234,14 @@ function pendingTranslateStorageKey(bookId: string) {
   return `mfv2:epubreader_v2:pendingTranslate:${bookId}`
 }
 
+function safeOrigin(url: string): string | null {
+  try {
+    return new URL(url).origin
+  } catch {
+    return null
+  }
+}
+
 function loadPendingTranslateVariants(bookId: string): TranslateVariant[] {
   try {
     if (typeof window === 'undefined' || typeof localStorage === 'undefined')
@@ -601,6 +609,15 @@ const EpubReaderV2Inner = forwardRef<
     if (variant !== 'original' && resolvedVariantUrl) return resolvedVariantUrl
     return bookUrl
   }, [variant, resolvedVariantUrl, bookUrl])
+
+  const bookUrlOrigin = useMemo(() => safeOrigin(bookUrl), [bookUrl])
+  const fetchCredentialsForActiveUrl = useMemo(() => {
+    const base = bookUrlOrigin
+    if (!base) return undefined
+    const active = safeOrigin(activeBookUrl)
+    if (!active) return undefined
+    return active === base ? ('include' as const) : ('omit' as const)
+  }, [bookUrlOrigin, activeBookUrl])
 
   useEffect(() => {
     // Auto-focus the container when component mounts or book changes
@@ -2516,6 +2533,7 @@ const EpubReaderV2Inner = forwardRef<
         const epubBuffer = await fetchArrayBufferWithProgress({
           url: activeBookUrl,
           headers: authHeaders,
+          credentials: fetchCredentialsForActiveUrl,
           signal: abort.signal,
           onProgress: (p) => alive && setProgress(p),
         })

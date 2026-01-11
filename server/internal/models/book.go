@@ -17,6 +17,7 @@ type Book struct {
 	Authors            []string            `json:"authors"`
 	ThumbnailURL       string              `json:"thumbnail_url"`
 	TransformationData map[string][]string `json:"transformation_data"`
+	SourceSizeBytes    int64               `json:"source_size_bytes"`
 	Visibility         string              `json:"visibility"`
 	OwnerUserID        *uuid.UUID          `json:"owner_user_id"`
 	CreatedAt          time.Time           `json:"created_at"`
@@ -45,7 +46,7 @@ type BookSearchResult struct {
 
 func (r *BookRepository) GetAll(ctx context.Context) ([]Book, error) {
 	rows, err := r.pool.Query(ctx, `
-		SELECT id, url, title, authors, thumbnail_url, transformation_data, visibility, owner_user_id, created_at, updated_at
+		SELECT id, url, title, authors, thumbnail_url, transformation_data, source_size_bytes, visibility, owner_user_id, created_at, updated_at
 		FROM books
 		ORDER BY created_at DESC
 	`)
@@ -66,6 +67,7 @@ func (r *BookRepository) GetAll(ctx context.Context) ([]Book, error) {
 			&book.Authors,
 			&book.ThumbnailURL,
 			&transformationDataJSON,
+			&book.SourceSizeBytes,
 			&book.Visibility,
 			&book.OwnerUserID,
 			&book.CreatedAt,
@@ -124,7 +126,7 @@ func (r *BookRepository) SearchPublic(ctx context.Context, query string, limit i
 	rows, err := r.pool.Query(ctx, `
 		WITH ranked AS (
 			SELECT
-				id, url, title, authors, thumbnail_url, transformation_data, visibility, owner_user_id, created_at, updated_at,
+				id, url, title, authors, thumbnail_url, transformation_data, source_size_bytes, visibility, owner_user_id, created_at, updated_at,
 				CASE
 					WHEN $1 = '' THEN 0
 					ELSE GREATEST(
@@ -143,7 +145,7 @@ func (r *BookRepository) SearchPublic(ctx context.Context, query string, limit i
 				)
 		)
 		SELECT
-			id, url, title, authors, thumbnail_url, transformation_data, visibility, owner_user_id, created_at, updated_at, rank
+			id, url, title, authors, thumbnail_url, transformation_data, source_size_bytes, visibility, owner_user_id, created_at, updated_at, rank
 		FROM ranked
 		WHERE ($3::bool = false) OR ((rank, created_at, id) < ($4, $5, $6))
 		ORDER BY rank DESC, created_at DESC, id DESC
@@ -167,6 +169,7 @@ func (r *BookRepository) SearchPublic(ctx context.Context, query string, limit i
 			&book.Authors,
 			&book.ThumbnailURL,
 			&transformationDataJSON,
+			&book.SourceSizeBytes,
 			&book.Visibility,
 			&book.OwnerUserID,
 			&book.CreatedAt,
@@ -255,7 +258,7 @@ func (r *BookRepository) SearchPersonal(
 	rows, err := r.pool.Query(ctx, `
 		WITH ranked AS (
 			SELECT
-				b.id, b.url, b.title, b.authors, b.thumbnail_url, b.transformation_data,
+				b.id, b.url, b.title, b.authors, b.thumbnail_url, b.transformation_data, b.source_size_bytes,
 				b.visibility, b.owner_user_id, b.created_at, b.updated_at,
 				CASE
 					WHEN $3 = '' THEN 0
@@ -276,7 +279,7 @@ func (r *BookRepository) SearchPersonal(
 				)
 		)
 		SELECT
-			id, url, title, authors, thumbnail_url, transformation_data, visibility, owner_user_id, created_at, updated_at, rank
+			id, url, title, authors, thumbnail_url, transformation_data, source_size_bytes, visibility, owner_user_id, created_at, updated_at, rank
 		FROM ranked
 		WHERE ($4::bool = false) OR ((rank, created_at, id) < ($5, $6, $7))
 		ORDER BY rank DESC, created_at DESC, id DESC
@@ -300,6 +303,7 @@ func (r *BookRepository) SearchPersonal(
 			&book.Authors,
 			&book.ThumbnailURL,
 			&transformationDataJSON,
+			&book.SourceSizeBytes,
 			&book.Visibility,
 			&book.OwnerUserID,
 			&book.CreatedAt,
@@ -342,7 +346,7 @@ func (r *BookRepository) SearchPersonal(
 
 func (r *BookRepository) GetAllPublic(ctx context.Context) ([]Book, error) {
 	rows, err := r.pool.Query(ctx, `
-		SELECT id, url, title, authors, thumbnail_url, transformation_data, visibility, owner_user_id, created_at, updated_at
+		SELECT id, url, title, authors, thumbnail_url, transformation_data, source_size_bytes, visibility, owner_user_id, created_at, updated_at
 		FROM books
 		WHERE visibility = 'public'
 		ORDER BY created_at DESC
@@ -364,6 +368,7 @@ func (r *BookRepository) GetAllPublic(ctx context.Context) ([]Book, error) {
 			&book.Authors,
 			&book.ThumbnailURL,
 			&transformationDataJSON,
+			&book.SourceSizeBytes,
 			&book.Visibility,
 			&book.OwnerUserID,
 			&book.CreatedAt,
@@ -386,7 +391,7 @@ func (r *BookRepository) GetAllPublic(ctx context.Context) ([]Book, error) {
 func (r *BookRepository) GetAllForUser(ctx context.Context, userID uuid.UUID, email string) ([]Book, error) {
 	normalized := NormalizeEmail(email)
 	rows, err := r.pool.Query(ctx, `
-		SELECT DISTINCT b.id, b.url, b.title, b.authors, b.thumbnail_url, b.transformation_data,
+		SELECT DISTINCT b.id, b.url, b.title, b.authors, b.thumbnail_url, b.transformation_data, b.source_size_bytes,
 		       b.visibility, b.owner_user_id, b.created_at, b.updated_at
 		FROM books b
 		LEFT JOIN book_shares bs ON bs.book_id = b.id AND bs.email = $2
@@ -412,6 +417,7 @@ func (r *BookRepository) GetAllForUser(ctx context.Context, userID uuid.UUID, em
 			&book.Authors,
 			&book.ThumbnailURL,
 			&transformationDataJSON,
+			&book.SourceSizeBytes,
 			&book.Visibility,
 			&book.OwnerUserID,
 			&book.CreatedAt,
@@ -476,7 +482,7 @@ func (r *BookRepository) GetByID(ctx context.Context, id uuid.UUID) (*Book, erro
 	var transformationDataJSON []byte
 
 	err := r.pool.QueryRow(ctx, `
-		SELECT id, url, title, authors, thumbnail_url, transformation_data, visibility, owner_user_id, created_at, updated_at
+		SELECT id, url, title, authors, thumbnail_url, transformation_data, source_size_bytes, visibility, owner_user_id, created_at, updated_at
 		FROM books
 		WHERE id = $1
 	`, id).Scan(
@@ -486,6 +492,7 @@ func (r *BookRepository) GetByID(ctx context.Context, id uuid.UUID) (*Book, erro
 		&book.Authors,
 		&book.ThumbnailURL,
 		&transformationDataJSON,
+		&book.SourceSizeBytes,
 		&book.Visibility,
 		&book.OwnerUserID,
 		&book.CreatedAt,
@@ -518,6 +525,9 @@ func (r *BookRepository) Create(ctx context.Context, book *Book) error {
 	if book.Authors == nil {
 		book.Authors = []string{}
 	}
+	if book.SourceSizeBytes < 0 {
+		book.SourceSizeBytes = 0
+	}
 
 	transformationDataJSON, err := json.Marshal(book.TransformationData)
 	if err != nil {
@@ -525,9 +535,9 @@ func (r *BookRepository) Create(ctx context.Context, book *Book) error {
 	}
 
 	_, err = r.pool.Exec(ctx, `
-		INSERT INTO books (id, url, title, authors, thumbnail_url, transformation_data, visibility, owner_user_id)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-	`, book.ID, book.URL, book.Title, book.Authors, book.ThumbnailURL, transformationDataJSON, book.Visibility, book.OwnerUserID)
+		INSERT INTO books (id, url, title, authors, thumbnail_url, transformation_data, source_size_bytes, visibility, owner_user_id)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+	`, book.ID, book.URL, book.Title, book.Authors, book.ThumbnailURL, transformationDataJSON, book.SourceSizeBytes, book.Visibility, book.OwnerUserID)
 
 	return err
 }
@@ -582,6 +592,9 @@ func (r *BookRepository) Upsert(ctx context.Context, book *Book) error {
 	if book.Authors == nil {
 		book.Authors = []string{}
 	}
+	if book.SourceSizeBytes < 0 {
+		book.SourceSizeBytes = 0
+	}
 
 	transformationDataJSON, err := json.Marshal(book.TransformationData)
 	if err != nil {
@@ -589,19 +602,30 @@ func (r *BookRepository) Upsert(ctx context.Context, book *Book) error {
 	}
 
 	_, err = r.pool.Exec(ctx, `
-		INSERT INTO books (id, url, title, authors, thumbnail_url, transformation_data, visibility, owner_user_id)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		INSERT INTO books (id, url, title, authors, thumbnail_url, transformation_data, source_size_bytes, visibility, owner_user_id)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 		ON CONFLICT (id) DO UPDATE
 		SET url = EXCLUDED.url,
 			title = EXCLUDED.title,
 			authors = EXCLUDED.authors,
 			thumbnail_url = EXCLUDED.thumbnail_url,
 			transformation_data = EXCLUDED.transformation_data,
+			source_size_bytes = EXCLUDED.source_size_bytes,
 			visibility = EXCLUDED.visibility,
 			owner_user_id = EXCLUDED.owner_user_id,
 			updated_at = NOW()
-	`, book.ID, book.URL, book.Title, book.Authors, book.ThumbnailURL, transformationDataJSON, book.Visibility, book.OwnerUserID)
+	`, book.ID, book.URL, book.Title, book.Authors, book.ThumbnailURL, transformationDataJSON, book.SourceSizeBytes, book.Visibility, book.OwnerUserID)
 	return err
+}
+
+func (r *BookRepository) TotalSourceBytesForUser(ctx context.Context, userID uuid.UUID) (int64, error) {
+	var total int64
+	err := r.pool.QueryRow(ctx, `
+		SELECT COALESCE(SUM(source_size_bytes), 0)
+		FROM books
+		WHERE owner_user_id = $1
+	`, userID).Scan(&total)
+	return total, err
 }
 
 func (r *BookRepository) ExistsByURL(ctx context.Context, url string) (bool, error) {

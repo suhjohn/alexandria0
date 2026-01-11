@@ -509,14 +509,34 @@ func transformURLFromBook(book *models.Book, variantKey string) string {
 
 func sourceEPUBKeyFromBook(book *models.Book, r2 *storage.R2Client) (string, error) {
 	if book == nil || strings.TrimSpace(book.URL) == "" {
-		return "", errors.New("Book has no source URL")
+		return "", errors.New("Book has no source reference")
 	}
+	raw := strings.TrimSpace(book.URL)
 	if r2 != nil {
-		if key, ok := r2.KeyFromPublicURL(book.URL); ok {
+		if key, ok := r2.KeyFromPublicURL(raw); ok {
 			return key, nil
 		}
 	}
-	return "", errors.New("Book URL is not an R2 public URL")
+
+	if strings.HasPrefix(raw, "r2://") {
+		trimmed := strings.TrimPrefix(raw, "r2://")
+		if idx := strings.Index(trimmed, "/"); idx >= 0 {
+			key := strings.TrimSpace(trimmed[idx+1:])
+			if key != "" && !strings.HasPrefix(key, "/") {
+				return key, nil
+			}
+		}
+		return "", errors.New("Invalid r2:// source reference")
+	}
+
+	if strings.Contains(raw, "://") {
+		return "", errors.New("Book URL is not a supported R2 reference")
+	}
+	raw = strings.TrimPrefix(raw, "/")
+	if raw == "" {
+		return "", errors.New("Invalid source key")
+	}
+	return raw, nil
 }
 
 func parseTransformVariantKey(transformType string, lang string) (string, error) {

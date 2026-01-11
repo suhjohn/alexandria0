@@ -116,8 +116,20 @@ export function EpubReader({
         // Download EPUB
         setReaderState({ status: 'downloading', progress: 0 })
 
+        const fetchCredentials = (() => {
+          try {
+            const url = new URL(bookUrl)
+            return url.pathname.includes('/books/') && url.pathname.endsWith('/file')
+              ? ('include' as const)
+              : ('same-origin' as const)
+          } catch {
+            return 'same-origin' as const
+          }
+        })()
+
         const result = await epubFetcher.fetch(bookUrl, {
           headers: authHeaders,
+          credentials: fetchCredentials,
           onProgress: (progress) => {
             if (!cancelled) {
               setReaderState({ status: 'downloading', progress: progress.percentage })

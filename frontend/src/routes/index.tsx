@@ -19,13 +19,14 @@ import {
   PanelRightOpen,
   Search,
   Settings,
+  Upload,
   X,
 } from 'lucide-react'
 import { IoLibraryOutline, IoLogoGoogle } from 'react-icons/io5'
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useVirtualizer } from '@tanstack/react-virtual'
-import { getBook, searchBooks, type Book } from '@/data/books'
+import { getBook, getBookFileUrl, searchBooks, uploadBook, type Book } from '@/data/books'
 import type {
   EpubReaderV2Handle,
   EpubReaderV2Status,
@@ -270,6 +271,18 @@ function App() {
 
   const books = booksQuery.items
   const listScrollRef = useRef<HTMLDivElement | null>(null)
+  const uploadInputRef = useRef<HTMLInputElement | null>(null)
+  const [uploadDragActive, setUploadDragActive] = useState(false)
+  const uploadMutation = useMutation({
+    mutationFn: async (file: File) => uploadBook({ file }),
+    onSuccess: async (book) => {
+      setLibraryScope('personal')
+      setLeftPanelView('books')
+      await queryClient.invalidateQueries({ queryKey: ['books', 'search', 'personal'] })
+      updateSelectedBook(book.id)
+      listScrollRef.current?.scrollTo({ top: 0 })
+    },
+  })
   const listCount = books.length
   const showLoadMoreRow = hasNextBooksPage
   const loadMoreInFlightRef = useRef(false)
@@ -1330,6 +1343,40 @@ function App() {
                       </span>
                     </button>
                     <div className="flex items-center gap-2 shrink-0">
+                      {libraryScope === 'personal' && me && (
+                        <>
+                          <input
+                            ref={uploadInputRef}
+                            type="file"
+                            accept=".epub,application/epub+zip"
+                            className="hidden"
+                            onChange={(e) => {
+                              const file = e.target.files?.[0]
+                              e.target.value = ''
+                              if (!file) return
+                              uploadMutation.mutate(file)
+                            }}
+                          />
+                          <button
+                            type="button"
+                            onClick={() => uploadInputRef.current?.click()}
+                            disabled={uploadMutation.isPending}
+                            className={[
+                              'inline-flex items-center gap-1 rounded-md border border-[color:var(--accent-soft)] bg-[color:var(--paper)] px-2 py-1 text-[10px] text-[color:var(--ink)]/70 hover:bg-[color:var(--paper-deep)] transition-colors',
+                              uploadMutation.isPending
+                                ? 'opacity-60 cursor-not-allowed'
+                                : '',
+                            ].join(' ')}
+                          >
+                            {uploadMutation.isPending ? (
+                              <Loader2 className="w-3 h-3 animate-spin" />
+                            ) : (
+                              <Upload className="w-3 h-3" />
+                            )}
+                            Upload
+                          </button>
+                        </>
+                      )}
                       {booksQuery.isFetching && (
                         <Loader2 className="w-3 h-3 animate-spin" />
                       )}
@@ -1344,6 +1391,27 @@ function App() {
                     <div
                       ref={listScrollRef}
                       className="flex-1 overflow-y-auto"
+                      onDragEnter={(e) => {
+                        if (libraryScope !== 'personal' || !me) return
+                        e.preventDefault()
+                        setUploadDragActive(true)
+                      }}
+                      onDragOver={(e) => {
+                        if (libraryScope !== 'personal' || !me) return
+                        e.preventDefault()
+                        setUploadDragActive(true)
+                      }}
+                      onDragLeave={() => {
+                        setUploadDragActive(false)
+                      }}
+                      onDrop={(e) => {
+                        if (libraryScope !== 'personal' || !me) return
+                        e.preventDefault()
+                        setUploadDragActive(false)
+                        const file = e.dataTransfer.files?.[0]
+                        if (!file) return
+                        uploadMutation.mutate(file)
+                      }}
                       onScroll={(e) => {
                         if (!hasNextBooksPage || isFetchingNextBooksPage) return
                         const el = e.currentTarget
@@ -1367,6 +1435,13 @@ function App() {
                           Failed to load books.
                         </div>
                       )}
+                      {uploadMutation.error && (
+                        <div className="px-3 text-[color:var(--accent)] py-2 text-xs">
+                          {uploadMutation.error instanceof Error
+                            ? uploadMutation.error.message
+                            : 'Upload failed.'}
+                        </div>
+                      )}
                       {!booksQuery.isLoading &&
                         !booksQuery.error &&
                         books.length === 0 && (
@@ -1383,6 +1458,11 @@ function App() {
                             position: 'relative',
                           }}
                         >
+                          {uploadDragActive && libraryScope === 'personal' && me && (
+                            <div className="absolute inset-2 z-10 rounded-lg border border-dashed border-[color:var(--accent)] bg-[color:var(--paper)]/80 backdrop-blur-sm flex items-center justify-center text-xs text-[color:var(--ink)]/70">
+                              Drop an EPUB to upload
+                            </div>
+                          )}
                           {rowVirtualizer
                             .getVirtualItems()
                             .map((virtualRow) => {
@@ -1514,7 +1594,7 @@ function App() {
               <EpubReaderV2
                 ref={readerRef}
                 storageId={selectedBook.id}
-                bookUrl={selectedBook.url}
+                bookUrl={getBookFileUrl(selectedBook.id)}
                 transformationData={selectedBook.transformation_data}
                 onSelectionChange={setReaderSelectionToken}
                 onAddSelectionToChat={(sel) =>

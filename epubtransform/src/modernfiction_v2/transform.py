@@ -279,6 +279,40 @@ async def _process_html_file(
             MAX_HTML_BATCH_TOKENS,
         )
 
+    def _clean_llm_html(raw: str) -> str:
+        """
+        Best-effort cleanup for LLM outputs that may include code fences or extra prose.
+
+        We only ever want HTML/XML here.
+        """
+        text = (raw or "").strip()
+        if not text:
+            return ""
+
+        if text.startswith("```"):
+            lines = text.splitlines()
+            if len(lines) >= 3 and lines[0].startswith("```") and lines[-1].startswith("```"):
+                text = "\n".join(lines[1:-1]).strip()
+
+        # If the model returned prose + HTML, slice to the first/last tag.
+        if not text.lstrip().startswith("<"):
+            start = text.find("<")
+            end = text.rfind(">")
+            if 0 <= start < end:
+                text = text[start : end + 1].strip()
+
+        return text
+
+    def _safe_parse_root(raw: str) -> etree._Element | None:
+        cleaned = _clean_llm_html(raw)
+        if not cleaned:
+            return None
+        try:
+            root = etree.fromstring(cleaned, parser)
+        except Exception:
+            return None
+        return root if root is not None else None
+
     async def _process_batch(
         batch: list[etree._Element],
     ) -> tuple[list[etree._Element], list[etree._Element] | None]:
@@ -291,9 +325,8 @@ async def _process_html_file(
         async with llm_semaphore:
             wrapped_out = await replace_html(wrapped_in, prompt)
 
-        try:
-            out_root = etree.fromstring(wrapped_out, parser)
-        except Exception:
+        out_root = _safe_parse_root(wrapped_out)
+        if out_root is None:
             return (batch, None)
 
         out_ps = out_root.xpath(".//*[local-name()='p']")
@@ -306,11 +339,8 @@ async def _process_html_file(
         p_html = etree.tostring(p, encoding="unicode")
         async with llm_semaphore:
             new_html = await replace_html(p_html, prompt)
-        try:
-            frag = etree.fromstring(new_html, parser)
-            return (p, frag)
-        except Exception:
-            return (p, None)
+        frag = _safe_parse_root(new_html)
+        return (p, frag)
 
     # Phase 2: run batch calls concurrently, then apply replacements in a stable order.
     batch_results = await asyncio.gather(*(_process_batch(b) for b in batches))
