@@ -9,7 +9,7 @@ CREATE TABLE IF NOT EXISTS transform_jobs (
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS idx_transform_jobs_book_id ON transform_jobs(book_id);
+CREATE INDEX IF NOT EXISTS idx_transform_jobs_book_id ON transform_jobs(book_id);
 CREATE INDEX IF NOT EXISTS idx_transform_jobs_status ON transform_jobs(status);
 
 -- +migrate Down
