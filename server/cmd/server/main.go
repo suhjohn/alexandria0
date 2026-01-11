@@ -119,12 +119,13 @@ func runServe(cmd *cobra.Command, args []string) error {
 	tokenRepo := models.NewMagicLinkTokenRepository(database.Pool)
 	sessionRepo := models.NewSessionRepository(database.Pool)
 	authService := handlers.NewAuthService(userRepo, sessionRepo)
-	booksHandler := handlers.NewBooksHandler(bookRepo, authService)
 
 	r2Client, err := storage.NewR2Client(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to create R2 client: %w", err)
 	}
+
+	booksHandler := handlers.NewBooksHandler(bookRepo, authService, r2Client)
 
 	transformHandler := handlers.NewBookTransformHandler(
 		bookRepo,
@@ -167,6 +168,8 @@ func runServe(cmd *cobra.Command, args []string) error {
 	r.Get("/books", booksHandler.GetAll)
 	r.Get("/books/search", booksHandler.Search)
 	r.Get("/books/{id}", booksHandler.GetByID)
+	r.Get("/books/{id}/file", booksHandler.GetFile)
+	r.Post("/books/upload", booksHandler.Upload)
 	r.Post("/books/{id}/transform", transformHandler.StartTransform)
 	r.Get("/books/{id}/transform", transformHandler.GetTransform)
 	r.Post("/auth/request", authHandler.RequestMagicLink)

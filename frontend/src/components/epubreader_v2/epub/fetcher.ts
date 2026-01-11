@@ -16,13 +16,14 @@ function looksLikeZip(buffer: ArrayBuffer): boolean {
 export async function fetchArrayBufferWithProgress(options: {
   url: string;
   headers?: Record<string, string>;
+  credentials?: RequestCredentials;
   signal?: AbortSignal;
   onProgress?: (progress: EpubReaderV2Progress) => void;
 }): Promise<ArrayBuffer> {
-  const { url, headers, signal, onProgress } = options;
+  const { url, headers, credentials, signal, onProgress } = options;
   let response: Response;
   try {
-    response = await fetch(url, { headers, signal, redirect: 'follow' });
+    response = await fetch(url, { headers, credentials, signal, redirect: 'follow' });
   } catch (err) {
     throw new EpubReaderV2Error('FETCH_FAILED', `Failed to fetch EPUB: ${url}`, err);
   }
