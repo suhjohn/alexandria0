@@ -404,9 +404,42 @@ function App() {
     () => readerRef.current?.getVisiblePage?.() ?? null,
     [],
   )
+  const getCurrentReaderPageStable = useCallback(
+    (options?: { timeoutMs?: number }) =>
+      readerRef.current?.getVisiblePageStable?.(options) ??
+      Promise.resolve(readerRef.current?.getVisiblePage?.() ?? null),
+    [],
+  )
+  const getCurrentReaderPageParts = useCallback(
+    (options?: { maxChars?: number; maxImages?: number; maxImageBytes?: number }) =>
+      readerRef.current?.getVisiblePageParts(options) ?? Promise.resolve(null),
+    [],
+  )
+  const getCurrentReaderPagePartsStable = useCallback(
+    (options?: {
+      maxChars?: number
+      maxImages?: number
+      maxImageBytes?: number
+      timeoutMs?: number
+    }) =>
+      readerRef.current?.getVisiblePagePartsStable?.(options) ??
+      readerRef.current?.getVisiblePageParts(options) ??
+      Promise.resolve(null),
+    [],
+  )
   const getSpineItemText = useCallback(
     (options: { spineIndex: number; maxChars?: number }) =>
       readerRef.current?.getSpineItemText(options) ?? Promise.resolve(null),
+    [],
+  )
+  const getSpineItemParts = useCallback(
+    (options: {
+      spineIndex: number
+      maxChars?: number
+      maxImages?: number
+      maxImageBytes?: number
+    }) =>
+      readerRef.current?.getSpineItemParts(options) ?? Promise.resolve(null),
     [],
   )
 
@@ -589,6 +622,13 @@ function App() {
       const id = raw.trim()
       if (!id) return null
 
+      // For modern chips we store the library book id (possibly versioned).
+      // We can navigate even if the book isn't in the currently loaded
+      // virtualized list (e.g. search filter / pagination).
+      if (!/^https?:\/\//i.test(id)) {
+        return stripVariantSuffix(id)
+      }
+
       const stripped = stripVariantSuffix(id)
       const candidates = [stripped, id]
 
@@ -599,14 +639,12 @@ function App() {
 
       // Back-compat / defensive: some older chips may have stored a URL (original or transformed)
       // instead of the library book id.
-      if (/^https?:\/\//i.test(id)) {
-        const found = books.find((b) => {
-          if (b.url === id) return true
-          const urls = Object.values(b.transformation_data).flat()
-          return urls.includes(id)
-        })
-        if (found) return found.id
-      }
+      const found = books.find((b) => {
+        if (b.url === id) return true
+        const urls = Object.values(b.transformation_data).flat()
+        return urls.includes(id)
+      })
+      if (found) return found.id
 
       return null
     }
@@ -617,6 +655,10 @@ function App() {
     ) => {
       const id = raw.trim()
       if (!id) return resolvedId
+
+      // For non-URL ids, keep the exact chip id so the reader can restore the
+      // correct variant (e.g. `@modernify`) before applying offsets.
+      if (!/^https?:\/\//i.test(id)) return id
 
       // If this already looks like a versioned id for an existing book, keep it.
       const stripped = stripVariantSuffix(id)
@@ -1674,7 +1716,11 @@ function App() {
                   : null
               }
               getCurrentReaderPage={getCurrentReaderPage}
+              getCurrentReaderPageStable={getCurrentReaderPageStable}
+              getCurrentReaderPageParts={getCurrentReaderPageParts}
+              getCurrentReaderPagePartsStable={getCurrentReaderPagePartsStable}
               getSpineItemText={getSpineItemText}
+              getSpineItemParts={getSpineItemParts}
             />
           </ResizableWindow>
         </div>

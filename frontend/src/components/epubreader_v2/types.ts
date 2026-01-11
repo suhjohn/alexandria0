@@ -88,6 +88,14 @@ export type EpubReaderV2Location = {
   href: string;
 };
 
+export type EpubReaderV2VisiblePage = {
+  href: string;
+  spineIndex: number;
+  pageIndex: number;
+  chapterTotalPages: number;
+  text: string;
+};
+
 export type EpubReaderV2SpineItem = {
   id: string;
   href: string;
@@ -95,6 +103,13 @@ export type EpubReaderV2SpineItem = {
   linear: boolean;
   properties: string[];
   title?: string;
+};
+
+export type EpubReaderV2ChapterSuggestion = {
+  title: string;
+  href: string;
+  spineIndex: number;
+  depth: number;
 };
 
 export type EpubReaderV2TocItem = {
@@ -119,6 +134,12 @@ export type EpubReaderV2BookMetadata = {
   date?: string;
   identifier?: string;
   modified?: string;
+};
+
+export type EpubReaderV2CurrentBook = {
+  bookId: string;
+  bookTitle: string;
+  metadata?: EpubReaderV2BookMetadata;
 };
 
 export type EpubReaderV2ContextPart =

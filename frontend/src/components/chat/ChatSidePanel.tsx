@@ -31,8 +31,17 @@ import remarkGfm from 'remark-gfm'
 
 import type { ChatConversation, ChatMessage } from '@/lib/chat-db'
 import { getChatDb } from '@/lib/chat-db'
-import type { EpubReaderV2BookMetadata } from '@/components/epubreader_v2/types'
+import type {
+  EpubReaderV2ChapterSuggestion,
+  EpubReaderV2CurrentBook,
+  EpubReaderV2VisiblePage,
+} from '@/components/epubreader_v2/types'
 import { cn } from '@/lib/utils'
+import {
+  buildReferenceMessage as buildEpubReferenceMessage,
+  buildVisiblePageMessage as buildEpubVisiblePageMessage,
+  currentBookSystemPrompt,
+} from './epubChatContext'
 import {
   HoverCard,
   HoverCardContent,
@@ -111,26 +120,9 @@ type BookRefNavigatePayload =
   | { bookId: string; spineIndex: number; textOffset: number }
   | { bookId: string; href: string }
 
-type ChapterSuggestion = {
-  title: string
-  href: string
-  spineIndex: number
-  depth: number
-}
-
-type CurrentBookInfo = {
-  bookId: string
-  bookTitle: string
-  metadata?: EpubReaderV2BookMetadata
-}
-
-type CurrentReaderPage = {
-  href: string
-  spineIndex: number
-  pageIndex: number
-  chapterTotalPages: number
-  text: string
-}
+type ChapterSuggestion = EpubReaderV2ChapterSuggestion
+type CurrentBookInfo = EpubReaderV2CurrentBook
+type CurrentReaderPage = EpubReaderV2VisiblePage
 
 function createId() {
   if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) {
@@ -159,73 +151,6 @@ function bookRefTextValue(attrs: any) {
   const selected = String(attrs?.selectedText ?? '').trim()
   if (selected) return selected
   return bookRefDisplayLabel(attrs)
-}
-
-function stripHtmlLike(text: string): string {
-  return String(text ?? '')
-    .replace(/<[^>]*>/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim()
-}
-
-function currentBookSystemPrompt(currentBook: CurrentBookInfo | null): string {
-  if (!currentBook) return ''
-
-  const metadata = currentBook.metadata ?? {}
-  const title = String(metadata.title ?? currentBook.bookTitle ?? '').trim()
-  const author = String(metadata.author ?? '').trim()
-  const language = String(metadata.language ?? '').trim()
-  const publisher = String(metadata.publisher ?? '').trim()
-  const date = String(metadata.date ?? '').trim()
-  const identifier = String(metadata.identifier ?? '').trim()
-  const modified = String(metadata.modified ?? '').trim()
-  const subjects = Array.isArray(metadata.subjects) ? metadata.subjects : []
-  const descriptionRaw = String(metadata.description ?? '').trim()
-  const description = stripHtmlLike(descriptionRaw)
-
-  const lines: string[] = [
-    'You are a reading assistant embedded in an EPUB reader.',
-    'Use the current book metadata as context. Do not invent missing details.',
-    '',
-    'Current book metadata:',
-    title ? `Title: ${truncateSnippet(title, 160)}` : undefined,
-    author ? `Author: ${truncateSnippet(author, 120)}` : undefined,
-    language ? `Language: ${truncateSnippet(language, 60)}` : undefined,
-    publisher ? `Publisher: ${truncateSnippet(publisher, 120)}` : undefined,
-    date ? `Date: ${truncateSnippet(date, 40)}` : undefined,
-    subjects.length
-      ? `Subjects: ${truncateSnippet(subjects.slice(0, 12).join(', '), 240)}`
-      : undefined,
-    identifier ? `Identifier: ${truncateSnippet(identifier, 120)}` : undefined,
-    modified ? `Modified: ${truncateSnippet(modified, 40)}` : undefined,
-    description
-      ? `Description: ${truncateSnippet(description, 600)}`
-      : undefined,
-  ].filter(Boolean) as string[]
-
-  return lines.join('\n').trim()
-}
-
-function currentVisiblePageSystemPrompt(page: CurrentReaderPage | null): string {
-  if (!page) return ''
-  const href = String(page.href ?? '').trim()
-  const text = String(page.text ?? '').trim()
-  if (!href && !text) return ''
-
-  const pageLabel =
-    page.chapterTotalPages > 1
-      ? `Page: ${page.pageIndex + 1}/${page.chapterTotalPages}`
-      : `Page: ${page.pageIndex + 1}`
-
-  const lines: string[] = [
-    'Currently visible page (may be partial):',
-    href ? `Href: ${truncateSnippet(href, 180)}` : undefined,
-    `SpineIndex: ${page.spineIndex}`,
-    pageLabel,
-    text ? `Text:\n${truncateSnippet(text, 8000)}` : undefined,
-  ].filter(Boolean) as string[]
-
-  return lines.join('\n').trim()
 }
 
 function visitTiptapDoc(
@@ -261,8 +186,10 @@ function extractChatImagesFromDoc(doc: TiptapDoc): Array<ChatImageAttrs> {
 function toModelMessages(
   messages: Array<ChatMessage>,
   systemPrompt?: string | null,
+  options?: { prefaceMessages?: Array<ModelMessage> },
 ): Array<ModelMessage> {
   const prompt = String(systemPrompt ?? '').trim()
+  const preface = options?.prefaceMessages ?? []
   const base = messages
     .filter((m) => m.role === 'user' || m.role === 'assistant')
     .map((m) => {
@@ -292,8 +219,8 @@ function toModelMessages(
       return { role: m.role, content: parts }
     })
 
-  if (!prompt) return base
-  return [{ role: 'system', content: prompt }, ...base]
+  if (!prompt) return [...preface, ...base]
+  return [{ role: 'system', content: prompt }, ...preface, ...base]
 }
 
 function formatRelativeDate(timestampMs: number) {
@@ -696,6 +623,7 @@ function ChatComposer(props: {
   const onModIRef = React.useRef(props.onModI)
   const onNewChatRef = React.useRef(props.onNewChat)
   const onToggleHistoryRef = React.useRef(props.onToggleHistory)
+  const onNavigateBookRefRef = React.useRef(props.onNavigateBookRef)
   const chapterSuggestionsRef = React.useRef<Array<ChapterSuggestion>>(
     props.chapterSuggestions ?? [],
   )
@@ -707,8 +635,15 @@ function ChatComposer(props: {
   onModIRef.current = props.onModI
   onNewChatRef.current = props.onNewChat
   onToggleHistoryRef.current = props.onToggleHistory
+  onNavigateBookRefRef.current = props.onNavigateBookRef
   chapterSuggestionsRef.current = props.chapterSuggestions ?? []
   currentBookRef.current = props.currentBook ?? null
+
+  const handleNavigateBookRef = React.useCallback(
+    (payload: BookRefNavigatePayload) =>
+      onNavigateBookRefRef.current?.(payload),
+    [],
+  )
 
   const chapterSuggestionRenderer = React.useMemo(
     () => createChapterSuggestionRenderer,
@@ -741,7 +676,7 @@ function ChatComposer(props: {
           },
         }),
         BookRefMention.configure({
-          onNavigate: props.onNavigateBookRef ?? null,
+          onNavigate: handleNavigateBookRef,
           suggestion: {
             char: '@',
             items: ({ query }: any) =>
@@ -1054,13 +989,21 @@ function ChatMessageRichContent(props: {
     [props.contentJson, props.fallbackText],
   )
 
+  const onNavigateBookRefRef = React.useRef(props.onNavigateBookRef)
+  onNavigateBookRefRef.current = props.onNavigateBookRef
+  const handleNavigateBookRef = React.useCallback(
+    (payload: BookRefNavigatePayload) =>
+      onNavigateBookRefRef.current?.(payload),
+    [],
+  )
+
   const editor = useEditor(
     {
       immediatelyRender: false,
       editable: false,
       extensions: [
         BookRefMention.configure({
-          onNavigate: props.onNavigateBookRef ?? null,
+          onNavigate: handleNavigateBookRef,
           suggestion: {
             char: '@',
             items: () => [],
@@ -1142,10 +1085,30 @@ export function ChatSidePanel(
     chapterSuggestions?: Array<ChapterSuggestion>
     currentBook?: CurrentBookInfo | null
     getCurrentReaderPage?: () => CurrentReaderPage | null
+    getCurrentReaderPageStable?: (options?: {
+      timeoutMs?: number
+    }) => Promise<CurrentReaderPage | null>
+    getCurrentReaderPageParts?: (options?: {
+      maxChars?: number
+      maxImages?: number
+      maxImageBytes?: number
+    }) => Promise<Array<TextPart | ImagePart> | null>
+    getCurrentReaderPagePartsStable?: (options?: {
+      maxChars?: number
+      maxImages?: number
+      maxImageBytes?: number
+      timeoutMs?: number
+    }) => Promise<Array<TextPart | ImagePart> | null>
     getSpineItemText?: (options: {
       spineIndex: number
       maxChars?: number
     }) => Promise<string | null>
+    getSpineItemParts?: (options: {
+      spineIndex: number
+      maxChars?: number
+      maxImages?: number
+      maxImageBytes?: number
+    }) => Promise<Array<TextPart | ImagePart> | null>
   } = {},
 ) {
   const isMac = React.useMemo(() => isMacPlatform(), [])
@@ -1206,70 +1169,35 @@ export function ChatSidePanel(
     )
   }, [])
 
-  const buildSystemPrompt = async (promptMessages: Array<ChatMessage>) => {
-    const pagePrompt = currentVisiblePageSystemPrompt(
-      props.getCurrentReaderPage?.() ?? null,
-    )
-    const base = [currentBookSystemPrompt(props.currentBook ?? null), pagePrompt]
-      .filter(Boolean)
+  const buildSystemPrompt = () => {
+    return currentBookSystemPrompt(props.currentBook ?? null).trim()
+  }
 
-    const refsByKey = new Map<string, BookRefAttrs>()
+  const buildVisiblePageMessage = async (): Promise<ModelMessage | null> => {
+    return await buildEpubVisiblePageMessage({
+      getCurrentReaderPage: props.getCurrentReaderPage,
+      getCurrentReaderPageStable: props.getCurrentReaderPageStable,
+      getCurrentReaderPageParts: props.getCurrentReaderPageParts,
+      getCurrentReaderPagePartsStable: props.getCurrentReaderPagePartsStable,
+    })
+  }
+
+  const buildReferenceMessage = async (
+    promptMessages: Array<ChatMessage>,
+  ): Promise<ModelMessage | null> => {
+    const refs: Array<BookRefAttrs> = []
     for (const msg of promptMessages) {
       if (msg.role !== 'user') continue
       const doc = parseTiptapDoc(msg.contentJson ?? null, msg.content)
-      for (const ref of extractBookRefsFromDoc(doc)) {
-        const bookId = String(ref.bookId ?? '').trim()
-        const spineIndex = Number(ref.spineIndex ?? NaN)
-        const href = String(ref.href ?? '').trim()
-        const chapterTitle = String(ref.chapterTitle ?? '').trim()
-        const key = `${bookId}:${Number.isFinite(spineIndex) ? spineIndex : ''}:${href}:${chapterTitle}`
-        if (!refsByKey.has(key)) refsByKey.set(key, ref)
-      }
+      refs.push(...extractBookRefsFromDoc(doc))
     }
-
-    const refs = Array.from(refsByKey.values())
-    if (refs.length === 0) return base.join('\n\n')
-
-    const chunks: string[] = []
     const currentBookId = String(props.currentBook?.bookId ?? '').trim()
-    const excerpts = await Promise.all(
-      refs.map(async (ref) => {
-        const selectedText = String(ref.selectedText ?? '').trim()
-        if (selectedText) return selectedText
-        const bookId = String(ref.bookId ?? '').trim()
-        if (bookId && currentBookId && bookId !== currentBookId) return ''
-        const spineIndex = Number(ref.spineIndex ?? NaN)
-        if (!Number.isFinite(spineIndex) || !props.getSpineItemText) return ''
-        return (await props.getSpineItemText({ spineIndex, maxChars: 18_000 })) ?? ''
-      }),
-    )
-
-    for (let i = 0; i < refs.length; i++) {
-      const ref = refs[i]
-      const excerpt = String(excerpts[i] ?? '').trim()
-      if (!excerpt) continue
-
-      const bookTitle = String(ref.bookTitle ?? '').trim() || 'Book'
-      const chapterTitle = String(ref.chapterTitle ?? '').trim()
-      const spineIndex = Number(ref.spineIndex ?? NaN)
-      const href = String(ref.href ?? '').trim()
-
-      const headerLines: string[] = [
-        `Book: ${truncateSnippet(bookTitle, 120)}`,
-        chapterTitle ? `Chapter: ${truncateSnippet(chapterTitle, 180)}` : undefined,
-        href ? `Href: ${truncateSnippet(href, 180)}` : undefined,
-        Number.isFinite(spineIndex) ? `SpineIndex: ${spineIndex}` : undefined,
-      ].filter(Boolean) as string[]
-
-      chunks.push(
-        `${headerLines.join('\n')}\nText:\n${truncateSnippet(excerpt, 18_000)}`,
-      )
-    }
-
-    if (chunks.length === 0) return base.join('\n\n')
-    return [...base, `Referenced text:\n\n${chunks.join('\n\n---\n\n')}`].join(
-      '\n\n',
-    )
+    return await buildEpubReferenceMessage({
+      refs,
+      currentBookId,
+      getSpineItemParts: props.getSpineItemParts,
+      getSpineItemText: props.getSpineItemText,
+    })
   }
 
   const setScrollPinned = React.useCallback((next: boolean) => {
@@ -1766,10 +1694,19 @@ export function ChatSidePanel(
       db.setActiveMessageId(conversationId, newUserMessage.id)
 
       const provider = createGoogleGenerativeAI({ apiKey: storedKey })
-      const systemPrompt = await buildSystemPrompt([...baseMessages, newUserMessage])
+      const systemPrompt = buildSystemPrompt()
+      const visiblePageMessage = await buildVisiblePageMessage()
+      const referenceMessage = await buildReferenceMessage([
+        ...baseMessages,
+        newUserMessage,
+      ])
+      const prefaceMessages = [visiblePageMessage, referenceMessage].filter(
+        Boolean,
+      ) as ModelMessage[]
       const promptMessages = toModelMessages(
         [...baseMessages, newUserMessage],
         systemPrompt,
+        prefaceMessages.length > 0 ? { prefaceMessages } : undefined,
       )
 
       setIsStreaming(true)
@@ -1880,8 +1817,17 @@ export function ChatSidePanel(
     try {
       const db = await getChatDb()
       const provider = createGoogleGenerativeAI({ apiKey: storedKey })
-      const systemPrompt = await buildSystemPrompt(baseMessages)
-      const promptMessages = toModelMessages(baseMessages, systemPrompt)
+      const systemPrompt = buildSystemPrompt()
+      const visiblePageMessage = await buildVisiblePageMessage()
+      const referenceMessage = await buildReferenceMessage(baseMessages)
+      const prefaceMessages = [visiblePageMessage, referenceMessage].filter(
+        Boolean,
+      ) as ModelMessage[]
+      const promptMessages = toModelMessages(
+        baseMessages,
+        systemPrompt,
+        prefaceMessages.length > 0 ? { prefaceMessages } : undefined,
+      )
 
       setIsStreaming(true)
 
@@ -2090,10 +2036,19 @@ export function ChatSidePanel(
       db.setActiveMessageId(conversationId, userMessage.id)
 
       const provider = createGoogleGenerativeAI({ apiKey: storedKey })
-      const systemPrompt = await buildSystemPrompt([...baseMessages, userMessage])
+      const systemPrompt = buildSystemPrompt()
+      const visiblePageMessage = await buildVisiblePageMessage()
+      const referenceMessage = await buildReferenceMessage([
+        ...baseMessages,
+        userMessage,
+      ])
+      const prefaceMessages = [visiblePageMessage, referenceMessage].filter(
+        Boolean,
+      ) as ModelMessage[]
       const promptMessages = toModelMessages(
         [...baseMessages, userMessage],
         systemPrompt,
+        prefaceMessages.length > 0 ? { prefaceMessages } : undefined,
       )
 
       setIsStreaming(true)

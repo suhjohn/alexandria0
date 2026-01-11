@@ -1,5 +1,6 @@
 import type { EpubReaderV2Settings, EpubReaderV2ThemePreset } from '../types';
 import { THEME_PRESETS } from '../types';
+import { ensureReaderContainers } from './containers';
 
 export type AppliedLayout = {
   viewportEl: HTMLElement;
@@ -47,18 +48,9 @@ export function applyReaderLayout(options: {
   root.style.setProperty('--mfv2-fg', colors.fg);
   root.style.setProperty('--mfv2-link', colors.link);
 
-  let viewportEl = doc.getElementById('mfv2-viewport') as HTMLElement | null;
-  let contentEl = doc.getElementById('mfv2-book-content') as HTMLElement | null;
-  if (!viewportEl || !contentEl) {
+  const { viewportEl, contentEl, created } = ensureReaderContainers(doc);
+  if (created) {
     const body = doc.body ?? doc.getElementsByTagName('body')[0] ?? doc.documentElement;
-    viewportEl = doc.createElement('div');
-    viewportEl.id = 'mfv2-viewport';
-    contentEl = doc.createElement('div');
-    contentEl.id = 'mfv2-book-content';
-    while (body.firstChild) contentEl.appendChild(body.firstChild);
-    viewportEl.appendChild(contentEl);
-    body.appendChild(viewportEl);
-
     body.style.margin = '0';
     body.style.padding = '0';
     body.style.width = `${viewportWidth}px`;

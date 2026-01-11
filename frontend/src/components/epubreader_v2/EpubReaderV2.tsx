@@ -9,14 +9,17 @@ import React, {
   useState,
 } from 'react'
 import { flushSync } from 'react-dom'
+import type { ImagePart, TextPart } from 'ai'
 import type {
   EpubReaderV2Location,
   EpubReaderV2BookMetadata,
+  EpubReaderV2ChapterSuggestion,
   EpubReaderV2Publication,
   EpubReaderV2ReadyPayload,
   EpubReaderV2Settings,
   EpubReaderV2TocItem,
   EpubReaderV2ThemePreset,
+  EpubReaderV2VisiblePage,
 } from './types'
 import { IoCheckmarkCircle, IoSparkles } from 'react-icons/io5'
 import { Loader2 } from 'lucide-react'
@@ -33,7 +36,8 @@ import {
   type AppliedLayout,
 } from './rendering/layout'
 import { IoList } from 'react-icons/io5'
-import { normalizePath, resolveRelativePath, splitHref } from './utils/path'
+import { hasUrlScheme, normalizePath, resolveRelativePath, splitHref } from './utils/path'
+import { isEpubCfiHref } from './utils/url'
 import { EpubResourceStore } from './rendering/resources'
 import { setReaderSettings, useReaderSettings } from '@/lib/reader-settings'
 import {
@@ -55,17 +59,29 @@ export type EpubReaderV2Handle = {
   goToHref: (href: string) => void
   setSettings: (settings: Partial<EpubReaderV2Settings>) => void
   getSettings: () => EpubReaderV2Settings
-  getVisiblePage: () => {
-    href: string
-    spineIndex: number
-    pageIndex: number
-    chapterTotalPages: number
-    text: string
-  } | null
+  getVisiblePage: () => EpubReaderV2VisiblePage | null
+  getVisiblePageStable: (options?: { timeoutMs?: number }) => Promise<EpubReaderV2VisiblePage | null>
+  getVisiblePageParts: (options?: {
+    maxChars?: number
+    maxImages?: number
+    maxImageBytes?: number
+  }) => Promise<Array<TextPart | ImagePart> | null>
+  getVisiblePagePartsStable: (options?: {
+    maxChars?: number
+    maxImages?: number
+    maxImageBytes?: number
+    timeoutMs?: number
+  }) => Promise<Array<TextPart | ImagePart> | null>
   getSpineItemText: (options: {
     spineIndex: number
     maxChars?: number
   }) => Promise<string | null>
+  getSpineItemParts: (options: {
+    spineIndex: number
+    maxChars?: number
+    maxImages?: number
+    maxImageBytes?: number
+  }) => Promise<Array<TextPart | ImagePart> | null>
 }
 
 export type EpubReaderV2Status =
@@ -105,12 +121,7 @@ export type EpubReaderV2Props = {
       bookId: string
       bookTitle: string
       metadata?: EpubReaderV2BookMetadata
-      chapters: Array<{
-        title: string
-        href: string
-        spineIndex: number
-        depth: number
-      }>
+      chapters: EpubReaderV2ChapterSuggestion[]
     } | null,
   ) => void
   pendingNavigation?: {
@@ -141,20 +152,261 @@ function normalizeVisibleText(text: string): string {
     .trim()
 }
 
+type CaretPoint = { node: Text; offset: number }
+
+function extractVisibleTextByCaret(options: {
+  doc: Document
+  layout: AppliedLayout
+  maxChars: number
+  marginX: number
+  marginY: number
+}): string | null {
+  const { doc, layout, maxChars, marginX, marginY } = options
+  const viewportEl = layout.viewportEl
+  const viewportRect = viewportEl.getBoundingClientRect()
+
+  const anyDoc = doc as any
+  const caretAtPoint = (x: number, y: number) => {
+    if (typeof anyDoc.caretPositionFromPoint === 'function') {
+      const pos = anyDoc.caretPositionFromPoint(x, y)
+      if (!pos) return null
+      return { node: pos.offsetNode as Node, offset: pos.offset as number }
+    }
+    if (typeof anyDoc.caretRangeFromPoint === 'function') {
+      const range = anyDoc.caretRangeFromPoint(x, y)
+      if (!range) return null
+      return {
+        node: range.startContainer as Node,
+        offset: range.startOffset as number,
+      }
+    }
+    return null
+  }
+
+  const firstTextDescendant = (n: Node): Text | null => {
+    const walker = doc.createTreeWalker(n, NodeFilter.SHOW_TEXT)
+    return (walker.nextNode() as Text | null) ?? null
+  }
+
+  const lastTextDescendant = (n: Node): Text | null => {
+    const walker = doc.createTreeWalker(n, NodeFilter.SHOW_TEXT)
+    let last: Text | null = null
+    while (walker.nextNode()) last = walker.currentNode as Text
+    return last
+  }
+
+  const normalizeCaret = (
+    raw: { node: Node; offset: number } | null,
+    direction: 'forward' | 'backward',
+  ): CaretPoint | null => {
+    if (!raw) return null
+    if (raw.node.nodeType === Node.TEXT_NODE) {
+      const textNode = raw.node as Text
+      const len = textNode.nodeValue?.length ?? 0
+      const offset = clamp(Math.floor(raw.offset), 0, len)
+      return { node: textNode, offset }
+    }
+    if (raw.node.nodeType !== Node.ELEMENT_NODE) return null
+    const el = raw.node as Element
+    const children = Array.from(el.childNodes ?? [])
+    if (children.length === 0) return null
+
+    if (direction === 'forward') {
+      const startIdx = clamp(Math.floor(raw.offset), 0, children.length - 1)
+      for (let i = startIdx; i < children.length; i++) {
+        const text = firstTextDescendant(children[i]!)
+        if (!text) continue
+        return { node: text, offset: 0 }
+      }
+      return null
+    }
+
+    const startIdx = clamp(Math.floor(raw.offset) - 1, 0, children.length - 1)
+    for (let i = startIdx; i >= 0; i--) {
+      const text = lastTextDescendant(children[i]!)
+      if (!text) continue
+      const len = text.nodeValue?.length ?? 0
+      return { node: text, offset: len }
+    }
+    return null
+  }
+
+  const isCaretPointVisible = (point: CaretPoint) => {
+    const parent = point.node.parentElement
+    if (!parent || !layout.contentEl.contains(parent)) return false
+    try {
+      const len = point.node.nodeValue?.length ?? 0
+      let startOffset = point.offset
+      let endOffset = point.offset
+      if (len <= 0) return false
+      if (point.offset < len) {
+        endOffset = point.offset + 1
+      } else if (point.offset > 0) {
+        startOffset = point.offset - 1
+      } else {
+        return false
+      }
+
+      const range = doc.createRange()
+      range.setStart(point.node, clamp(startOffset, 0, len))
+      range.setEnd(point.node, clamp(endOffset, 0, len))
+      const rects = Array.from(range.getClientRects?.() ?? [])
+      for (const rect of rects) {
+        if (rect.height < 1 || rect.width < 1) continue
+        const overlaps =
+          rect.bottom >= viewportRect.top - marginY &&
+          rect.top <= viewportRect.bottom + marginY &&
+          rect.right >= viewportRect.left - marginX &&
+          rect.left <= viewportRect.right + marginX
+        if (overlaps) return true
+      }
+      return false
+    } catch {
+      return false
+    }
+  }
+
+  const compareCaret = (a: CaretPoint, b: CaretPoint) => {
+    if (a.node === b.node) return a.offset - b.offset
+    const pos = a.node.compareDocumentPosition(b.node)
+    if (pos & Node.DOCUMENT_POSITION_FOLLOWING) return -1
+    if (pos & Node.DOCUMENT_POSITION_PRECEDING) return 1
+    return 0
+  }
+
+  const collectVisibleCaretPoints = (): Array<CaretPoint> => {
+    const left = viewportRect.left + 8
+    const right = viewportRect.right - 8
+    const top = viewportRect.top + 8
+    const bottom = viewportRect.bottom - 8
+    const xCandidates = [
+      left,
+      left + (right - left) * 0.25,
+      left + (right - left) * 0.5,
+      left + (right - left) * 0.75,
+      right,
+    ]
+
+    const points: Array<CaretPoint> = []
+    const stepY = 22
+    for (let y = top; y <= bottom; y += stepY) {
+      for (const x of xCandidates) {
+        const raw = caretAtPoint(x, y)
+        const point = normalizeCaret(raw, 'forward')
+        if (!point) continue
+        if (!isCaretPointVisible(point)) continue
+        points.push(point)
+      }
+    }
+
+    return points
+  }
+
+  const caretPoints = collectVisibleCaretPoints()
+  if (caretPoints.length === 0) return null
+
+  let start = caretPoints[0]!
+  let end = caretPoints[0]!
+  for (const p of caretPoints) {
+    if (compareCaret(p, start) < 0) start = p
+    if (compareCaret(p, end) > 0) end = p
+  }
+
+  try {
+    const range = doc.createRange()
+    range.setStart(start.node, start.offset)
+    range.setEnd(end.node, end.offset)
+    const rawText = range.toString()
+    const cleaned = normalizeVisibleText(rawText)
+    if (!cleaned) return null
+    if (cleaned.length <= maxChars) return cleaned
+    return `${cleaned.slice(0, Math.max(0, maxChars))}…`
+  } catch {
+    return null
+  }
+}
+
+function uint8ArrayToBase64(bytes: Uint8Array): string {
+  let binary = ''
+  const chunkSize = 0x8000
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    const chunk = bytes.subarray(i, i + chunkSize)
+    binary += String.fromCharCode(...chunk)
+  }
+  return btoa(binary)
+}
+
+async function fetchImageToPart(options: {
+  src: string
+  store?: EpubResourceStore | null
+  epubPathHint?: string | null
+  maxImageBytes: number
+}): Promise<ImagePart | null> {
+  const { src, store, epubPathHint, maxImageBytes } = options
+  const trimmed = String(src ?? '').trim()
+  if (!trimmed) return null
+
+  if (trimmed.startsWith('data:')) {
+    const match = /^data:([^;]+);base64,(.+)$/i.exec(trimmed)
+    if (!match) return null
+    const mediaType = String(match[1] ?? '').trim()
+    const base64 = String(match[2] ?? '').trim()
+    if (!mediaType || !base64) return null
+    const approxBytes = Math.floor((base64.length * 3) / 4)
+    if (approxBytes > maxImageBytes) return null
+    return { type: 'image', image: base64, mediaType }
+  }
+
+  const hint = String(epubPathHint ?? '').trim()
+  if (hint && store) {
+    const bytes = await store.readBytes(hint)
+    if (bytes.byteLength > maxImageBytes) return null
+    return {
+      type: 'image',
+      image: uint8ArrayToBase64(bytes),
+      mediaType: store.getMediaType(hint) || undefined,
+    }
+  }
+
+  if (trimmed.startsWith('blob:')) {
+    const res = await fetch(trimmed)
+    const arrayBuffer = await res.arrayBuffer()
+    if (arrayBuffer.byteLength > maxImageBytes) return null
+    const mediaType = res.headers.get('content-type') ?? undefined
+    return {
+      type: 'image',
+      image: uint8ArrayToBase64(new Uint8Array(arrayBuffer)),
+      mediaType,
+    }
+  }
+
+  return null
+}
+
 function extractVisibleText(options: {
   doc: Document
   layout: AppliedLayout
   flowMode: EpubReaderV2Settings['flowMode']
-  pageIndex: number
   maxChars: number
 }): string {
-  const { doc, layout, flowMode, pageIndex, maxChars } = options
+  const { doc, layout, flowMode, maxChars } = options
   const viewportEl = layout.viewportEl
   const viewportRect = viewportEl.getBoundingClientRect()
-  const root = doc.body ?? doc.documentElement
+  const root = layout.contentEl ?? doc.body ?? doc.documentElement
+
+  if (flowMode === 'paginated') {
+    const byCaret = extractVisibleTextByCaret({
+      doc,
+      layout,
+      maxChars,
+      marginX: 2,
+      marginY: 16,
+    })
+    if (byCaret) return byCaret
+  }
 
   const candidates = Array.from(
-    root.querySelectorAll('h1,h2,h3,h4,h5,h6,p,li,blockquote,pre'),
+    root.querySelectorAll('h1,h2,h3,h4,h5,h6,p,li,blockquote,pre,div,span'),
   ) as HTMLElement[]
 
   const pieces: string[] = []
@@ -174,35 +426,365 @@ function extractVisibleText(options: {
     used += chunk.length + 1
   }
 
-  const margin = 16
-  if (flowMode === 'scrolled') {
-    for (const el of candidates) {
-      if (used >= maxChars) break
-      const rect = el.getBoundingClientRect()
-      if (rect.height < 1 || rect.width < 1) continue
-      const overlaps =
-        rect.bottom >= viewportRect.top - margin &&
-        rect.top <= viewportRect.bottom + margin
-      if (!overlaps) continue
-      push(el.innerText || el.textContent || '')
-    }
-    return pieces.join('\n').slice(0, maxChars).trim()
+  const marginY = 16
+  const marginX = flowMode === 'scrolled' ? 16 : 2
+  const semanticSelector = 'h1,h2,h3,h4,h5,h6,p,li,blockquote,pre'
+
+  const isFallbackTextContainer = (el: HTMLElement) => {
+    const tag = el.tagName
+    if (tag !== 'DIV' && tag !== 'SPAN') return false
+    if (el.closest(semanticSelector)) return false
+    if (el.querySelector(semanticSelector)) return false
+    const cleaned = normalizeVisibleText(el.textContent || '')
+    if (cleaned.length < 3) return false
+    if (cleaned.length > 1500) return false
+    // Avoid selecting large layout wrappers that span multiple pages.
+    const descendantCount = el.querySelectorAll('*').length
+    if (descendantCount > 160) return false
+    const style = doc.defaultView?.getComputedStyle(el)
+    const display = style?.display ?? ''
+    if (display === 'none' || display === 'contents') return false
+    return true
   }
 
-  const pageLeft = pageIndex * layout.pageWidth
-  const pageRight = pageLeft + viewportEl.clientWidth
-  for (const el of candidates) {
+  const tagRank = (el: HTMLElement) => {
+    const tag = el.tagName
+    if (/^H[1-6]$/.test(tag)) return 0
+    if (
+      tag === 'P' ||
+      tag === 'LI' ||
+      tag === 'BLOCKQUOTE' ||
+      tag === 'PRE'
+    ) {
+      return 0
+    }
+    if (tag === 'DIV') return 1
+    if (tag === 'SPAN') return 2
+    return 3
+  }
+
+  const getFirstOverlappingRect = (el: HTMLElement): DOMRect | null => {
+    const rects = Array.from(el.getClientRects?.() ?? [])
+    if (rects.length === 0) return null
+
+    if (flowMode === 'scrolled') {
+      for (const rect of rects) {
+        if (rect.height < 1 || rect.width < 1) continue
+        const overlaps =
+          rect.bottom >= viewportRect.top - marginY &&
+          rect.top <= viewportRect.bottom + marginY &&
+          rect.right >= viewportRect.left - marginX &&
+          rect.left <= viewportRect.right + marginX
+        if (overlaps) return rect
+      }
+      return null
+    }
+
+    const pageLeft = viewportEl.scrollLeft
+    const pageRight = pageLeft + viewportEl.clientWidth
+    for (const rect of rects) {
+      if (rect.height < 1 || rect.width < 1) continue
+      const overlapsVertically =
+        rect.bottom >= viewportRect.top - marginY &&
+        rect.top <= viewportRect.bottom + marginY
+      if (!overlapsVertically) continue
+      const absoluteLeft = rect.left - viewportRect.left + pageLeft
+      const absoluteRight = absoluteLeft + rect.width
+      const overlapsHorizontally =
+        absoluteRight >= pageLeft - marginX && absoluteLeft <= pageRight + marginX
+      if (overlapsHorizontally) return rect
+    }
+    return null
+  }
+
+  const visibleBlocks = candidates
+    .filter((el) => {
+      if (el.tagName === 'DIV' || el.tagName === 'SPAN') {
+        if (!isFallbackTextContainer(el)) return false
+      }
+      return true
+    })
+    .map((el) => {
+      const rect = getFirstOverlappingRect(el)
+      if (!rect) return null
+      const absoluteTop = rect.top - viewportRect.top + viewportEl.scrollTop
+      const absoluteLeft = rect.left - viewportRect.left + viewportEl.scrollLeft
+      return { el, rect, absoluteTop, absoluteLeft }
+    })
+    .filter(Boolean) as Array<{
+    el: HTMLElement
+    rect: DOMRect
+    absoluteTop: number
+    absoluteLeft: number
+  }>
+  const prunedVisibleBlocks = visibleBlocks.filter((block) => {
+    const blockRank = tagRank(block.el)
+    for (const other of visibleBlocks) {
+      if (other.el === block.el) continue
+      if (!block.el.contains(other.el)) continue
+      if (blockRank >= tagRank(other.el)) return false
+    }
+    return true
+  })
+  prunedVisibleBlocks.sort((a, b) => {
+    if (a.absoluteTop !== b.absoluteTop) return a.absoluteTop - b.absoluteTop
+    return a.absoluteLeft - b.absoluteLeft
+  })
+
+  for (const { el } of prunedVisibleBlocks) {
     if (used >= maxChars) break
-    const rect = el.getBoundingClientRect()
-    if (rect.height < 1 || rect.width < 1) continue
-    const absoluteLeft = rect.left - viewportRect.left + viewportEl.scrollLeft
-    const absoluteRight = absoluteLeft + rect.width
-    const overlaps =
-      absoluteRight >= pageLeft - margin && absoluteLeft <= pageRight + margin
-    if (!overlaps) continue
     push(el.innerText || el.textContent || '')
   }
   return pieces.join('\n').slice(0, maxChars).trim()
+}
+
+async function extractVisibleParts(options: {
+  doc: Document
+  layout: AppliedLayout
+  flowMode: EpubReaderV2Settings['flowMode']
+  store?: EpubResourceStore | null
+  maxChars: number
+  maxImages: number
+  maxImageBytes: number
+}): Promise<Array<TextPart | ImagePart>> {
+  const {
+    doc,
+    layout,
+    flowMode,
+    store,
+    maxChars,
+    maxImages,
+    maxImageBytes,
+  } = options
+  const viewportEl = layout.viewportEl
+  const viewportRect = viewportEl.getBoundingClientRect()
+  const root = layout.contentEl ?? doc.body ?? doc.documentElement
+
+  if (flowMode === 'paginated') {
+    const parts: Array<TextPart | ImagePart> = []
+    const text = extractVisibleTextByCaret({
+      doc,
+      layout,
+      maxChars,
+      marginX: 2,
+      marginY: 16,
+    })
+    if (text) parts.push({ type: 'text', text })
+
+    if (maxImages > 0) {
+      const imgs = Array.from(root.querySelectorAll('img')) as HTMLImageElement[]
+      const marginY = 16
+      const marginX = 2
+      for (const img of imgs) {
+        if (parts.filter((p) => p.type === 'image').length >= maxImages) break
+        const rects = Array.from(img.getClientRects?.() ?? [])
+        const isVisible = rects.some((rect) => {
+          if (rect.height < 1 || rect.width < 1) return false
+          return (
+            rect.bottom >= viewportRect.top - marginY &&
+            rect.top <= viewportRect.bottom + marginY &&
+            rect.right >= viewportRect.left - marginX &&
+            rect.left <= viewportRect.right + marginX
+          )
+        })
+        if (!isVisible) continue
+
+        const alt = String(
+          img.getAttribute('alt') ?? img.getAttribute('title') ?? '',
+        ).trim()
+        const src = String(img.currentSrc || img.getAttribute('src') || '').trim()
+        const epubPathHint = String(
+          img.getAttribute('data-mfv2-epub-src') ?? '',
+        ).trim()
+
+        if (alt) parts.push({ type: 'text', text: `[Image: ${alt}]` })
+        try {
+          const imagePart = await fetchImageToPart({
+            src,
+            store,
+            epubPathHint: epubPathHint || null,
+            maxImageBytes,
+          })
+          if (imagePart) parts.push(imagePart)
+        } catch {
+          // ignore
+        }
+      }
+    }
+
+    return parts
+  }
+
+  const candidates = Array.from(
+    root.querySelectorAll('h1,h2,h3,h4,h5,h6,p,li,blockquote,pre,img,div,span'),
+  ) as HTMLElement[]
+
+  const parts: Array<TextPart | ImagePart> = []
+  let usedText = 0
+  let usedImages = 0
+  let textBuffer = ''
+
+  const flushText = () => {
+    const cleaned = normalizeVisibleText(textBuffer)
+    textBuffer = ''
+    if (!cleaned) return
+    if (usedText >= maxChars) return
+    const chunk = cleaned.length > 600 ? `${cleaned.slice(0, 600)}…` : cleaned
+    if (usedText + chunk.length > maxChars) {
+      const remain = Math.max(0, maxChars - usedText)
+      if (remain > 24)
+        parts.push({ type: 'text', text: `${chunk.slice(0, remain)}…` })
+      usedText = maxChars
+      return
+    }
+    parts.push({ type: 'text', text: chunk })
+    usedText += chunk.length + 1
+  }
+
+  const marginY = 16
+  const marginX = flowMode === 'scrolled' ? 16 : 2
+  const semanticSelector = 'h1,h2,h3,h4,h5,h6,p,li,blockquote,pre'
+
+  const isFallbackTextContainer = (el: HTMLElement) => {
+    const tag = el.tagName
+    if (tag !== 'DIV' && tag !== 'SPAN') return false
+    if (el.closest(semanticSelector)) return false
+    if (el.querySelector(semanticSelector)) return false
+    const cleaned = normalizeVisibleText(el.textContent || '')
+    if (cleaned.length < 3) return false
+    if (cleaned.length > 1500) return false
+    const descendantCount = el.querySelectorAll('*').length
+    if (descendantCount > 160) return false
+    const style = doc.defaultView?.getComputedStyle(el)
+    const display = style?.display ?? ''
+    if (display === 'none' || display === 'contents') return false
+    return true
+  }
+
+  const tagRank = (el: HTMLElement) => {
+    const tag = el.tagName
+    if (tag === 'IMG') return 0
+    if (/^H[1-6]$/.test(tag)) return 0
+    if (
+      tag === 'P' ||
+      tag === 'LI' ||
+      tag === 'BLOCKQUOTE' ||
+      tag === 'PRE'
+    ) {
+      return 0
+    }
+    if (tag === 'DIV') return 1
+    if (tag === 'SPAN') return 2
+    return 3
+  }
+
+  const getFirstOverlappingRect = (el: HTMLElement): DOMRect | null => {
+    const rects = Array.from(el.getClientRects?.() ?? [])
+    if (rects.length === 0) return null
+
+    if (flowMode === 'scrolled') {
+      for (const rect of rects) {
+        if (rect.height < 1 || rect.width < 1) continue
+        const overlaps =
+          rect.bottom >= viewportRect.top - marginY &&
+          rect.top <= viewportRect.bottom + marginY &&
+          rect.right >= viewportRect.left - marginX &&
+          rect.left <= viewportRect.right + marginX
+        if (overlaps) return rect
+      }
+      return null
+    }
+
+    const pageLeft = viewportEl.scrollLeft
+    const pageRight = pageLeft + viewportEl.clientWidth
+    for (const rect of rects) {
+      if (rect.height < 1 || rect.width < 1) continue
+      const overlapsVertically =
+        rect.bottom >= viewportRect.top - marginY &&
+        rect.top <= viewportRect.bottom + marginY
+      if (!overlapsVertically) continue
+      const absoluteLeft = rect.left - viewportRect.left + pageLeft
+      const absoluteRight = absoluteLeft + rect.width
+      const overlapsHorizontally =
+        absoluteRight >= pageLeft - marginX && absoluteLeft <= pageRight + marginX
+      if (overlapsHorizontally) return rect
+    }
+    return null
+  }
+
+  const visibleBlocks = candidates
+    .filter((el) => {
+      if (el.tagName === 'DIV' || el.tagName === 'SPAN') {
+        if (!isFallbackTextContainer(el)) return false
+      }
+      return true
+    })
+    .map((el) => {
+      const rect = getFirstOverlappingRect(el)
+      if (!rect) return null
+      const absoluteTop = rect.top - viewportRect.top + viewportEl.scrollTop
+      const absoluteLeft = rect.left - viewportRect.left + viewportEl.scrollLeft
+      return { el, rect, absoluteTop, absoluteLeft }
+    })
+    .filter(Boolean) as Array<{
+    el: HTMLElement
+    rect: DOMRect
+    absoluteTop: number
+    absoluteLeft: number
+  }>
+  const prunedVisibleBlocks = visibleBlocks.filter((block) => {
+    const blockRank = tagRank(block.el)
+    for (const other of visibleBlocks) {
+      if (other.el === block.el) continue
+      // Don't drop containers just because they include an image.
+      if (other.el instanceof HTMLImageElement) continue
+      if (!block.el.contains(other.el)) continue
+      if (blockRank >= tagRank(other.el)) return false
+    }
+    return true
+  })
+  prunedVisibleBlocks.sort((a, b) => {
+    if (a.absoluteTop !== b.absoluteTop) return a.absoluteTop - b.absoluteTop
+    return a.absoluteLeft - b.absoluteLeft
+  })
+
+  for (const { el } of prunedVisibleBlocks) {
+    if (usedText >= maxChars && usedImages >= maxImages) break
+
+    if (el instanceof HTMLImageElement) {
+      if (usedImages >= maxImages) continue
+      const alt = String(
+        el.getAttribute('alt') ?? el.getAttribute('title') ?? '',
+      ).trim()
+      const src = String(el.currentSrc || el.getAttribute('src') || '').trim()
+      const epubPathHint = String(el.getAttribute('data-mfv2-epub-src') ?? '').trim()
+
+      flushText()
+      if (alt) parts.push({ type: 'text', text: `[Image: ${alt}]` })
+
+      try {
+        const imagePart = await fetchImageToPart({
+          src,
+          store,
+          epubPathHint: epubPathHint || null,
+          maxImageBytes,
+        })
+        if (imagePart) {
+          parts.push(imagePart)
+          usedImages += 1
+        }
+      } catch {
+        // ignore
+      }
+      continue
+    }
+
+    textBuffer += `${el.innerText || el.textContent || ''}\n`
+    if (textBuffer.length > 1200) flushText()
+  }
+
+  flushText()
+  return parts
 }
 
 function extractSpineItemText(options: {
@@ -240,6 +822,139 @@ function extractSpineItemText(options: {
   }
 
   return pieces.join('\n\n').slice(0, maxChars).trim()
+}
+
+async function extractSpineItemParts(options: {
+  xhtmlText: string
+  xhtmlPath: string
+  store: EpubResourceStore
+  maxChars: number
+  maxImages: number
+  maxImageBytes: number
+}): Promise<Array<TextPart | ImagePart>> {
+  const { xhtmlText, xhtmlPath, store, maxChars, maxImages, maxImageBytes } =
+    options
+  const parser = new DOMParser()
+  const doc = parser.parseFromString(String(xhtmlText ?? ''), 'text/html')
+  const root = doc.body ?? doc.documentElement
+
+  const imageMetaByToken = new Map<
+    string,
+    { alt: string; part: ImagePart | null }
+  >()
+
+  const images = Array.from(root.querySelectorAll('img')) as HTMLImageElement[]
+  let includedImages = 0
+  let includedBytes = 0
+
+  const getImagePart = async (rawSrc: string): Promise<ImagePart | null> => {
+    const src = String(rawSrc ?? '').trim()
+    if (!src) return null
+
+    if (src.startsWith('data:')) {
+      const match = /^data:([^;]+);base64,(.+)$/i.exec(src)
+      if (!match) return null
+      const mediaType = String(match[1] ?? '').trim()
+      const base64 = String(match[2] ?? '').trim()
+      if (!mediaType || !base64) return null
+      const approxBytes = Math.floor((base64.length * 3) / 4)
+      if (approxBytes > maxImageBytes) return null
+      if (includedBytes + approxBytes > maxImageBytes * maxImages) return null
+      includedBytes += approxBytes
+      return { type: 'image', image: base64, mediaType }
+    }
+
+    if (
+      hasUrlScheme(src)
+    ) {
+      return null
+    }
+
+    const { path } = splitHref(src)
+    if (!path) return null
+    const resolved = resolveRelativePath(xhtmlPath, path)
+    const bytes = await store.readBytes(resolved)
+    if (bytes.byteLength > maxImageBytes) return null
+    if (includedBytes + bytes.byteLength > maxImageBytes * maxImages) return null
+    includedBytes += bytes.byteLength
+    return {
+      type: 'image',
+      image: uint8ArrayToBase64(bytes),
+      mediaType: store.getMediaType(resolved) || undefined,
+    }
+  }
+
+  for (let i = 0; i < images.length; i++) {
+    const imgEl = images[i]
+    if (includedImages >= maxImages) {
+      imgEl.remove()
+      continue
+    }
+
+    const rawSrc = String(imgEl.getAttribute('src') ?? '').trim()
+    const alt = String(
+      imgEl.getAttribute('alt') ??
+        imgEl.getAttribute('title') ??
+        '',
+    ).trim()
+    const token = `[[[MFV2_IMG_${i}]]]`
+
+    imgEl.replaceWith(doc.createTextNode(token))
+
+    try {
+      const part = await getImagePart(rawSrc)
+      if (part) includedImages += 1
+      imageMetaByToken.set(token, { alt, part })
+    } catch {
+      imageMetaByToken.set(token, { alt, part: null })
+    }
+  }
+
+  const rawText = normalizeVisibleText(root.textContent || '')
+  if (!rawText && imageMetaByToken.size === 0) return []
+
+  const parts: Array<TextPart | ImagePart> = []
+  let usedText = 0
+  let buffer = ''
+
+  const flush = () => {
+    const cleaned = normalizeVisibleText(buffer)
+    buffer = ''
+    if (!cleaned) return
+    if (usedText >= maxChars) return
+    if (usedText + cleaned.length > maxChars) {
+      const remain = Math.max(0, maxChars - usedText)
+      if (remain > 24) parts.push({ type: 'text', text: `${cleaned.slice(0, remain)}…` })
+      usedText = maxChars
+      return
+    }
+    parts.push({ type: 'text', text: cleaned })
+    usedText += cleaned.length + 2
+  }
+
+  const tokenRegex = /\[\[\[MFV2_IMG_\d+\]\]\]/g
+  let lastIndex = 0
+  for (let match = tokenRegex.exec(rawText); match; match = tokenRegex.exec(rawText)) {
+    if (usedText >= maxChars) break
+    const token = match[0] ?? ''
+    buffer += rawText.slice(lastIndex, match.index)
+    lastIndex = match.index + token.length
+
+    const meta = imageMetaByToken.get(token) ?? null
+    flush()
+    if (!meta) continue
+
+    const alt = String(meta.alt ?? '').trim()
+    if (alt) parts.push({ type: 'text', text: `[Image: ${alt}]` })
+    if (meta.part) parts.push(meta.part)
+  }
+
+  if (usedText < maxChars) {
+    buffer += rawText.slice(lastIndex)
+    flush()
+  }
+
+  return parts
 }
 
 function storageKey(bookId: string) {
@@ -767,6 +1482,35 @@ const EpubReaderV2Inner = forwardRef<
   const persistenceIdRef = useRef<string | null>(null)
   const zipRef = useRef<ZipWorkerClient | null>(null)
   const resourceStoreRef = useRef<EpubResourceStore | null>(null)
+
+  const spineIndexByPath = useMemo(() => {
+    const pub = publication
+    const map = new Map<string, number>()
+    if (!pub) return map
+    for (let i = 0; i < pub.spine.length; i++) {
+      const href = String(pub.spine[i]?.href ?? '').trim()
+      if (!href) continue
+      const path = normalizePath(splitHref(href).path)
+      if (!path || map.has(path)) continue
+      map.set(path, i)
+    }
+    return map
+  }, [publication])
+
+  const tocTitleByPath = useMemo(() => {
+    const pub = publication
+    const map = new Map<string, string>()
+    if (!pub) return map
+    const flat = flattenToc(pub.toc ?? [])
+    for (const { item } of flat) {
+      const title = String(item.title ?? '').trim()
+      if (!title) continue
+      const path = normalizePath(splitHref(String(item.href ?? '')).path)
+      if (!path || map.has(path)) continue
+      map.set(path, title)
+    }
+    return map
+  }, [publication])
 
   const settings = useReaderSettings(initialSettings)
   const settingsRef = useRef(settings)
@@ -1414,10 +2158,8 @@ const EpubReaderV2Inner = forwardRef<
         return
       }
 
-      const nextSpineIndex = publication.spine.findIndex(
-        (s) => normalizePath(s.href) === targetPath,
-      )
-      if (nextSpineIndex === -1) return
+      const nextSpineIndex = spineIndexByPath.get(targetPath) ?? -1
+      if (nextSpineIndex < 0) return
       loadSpine(nextSpineIndex, {
         pageIndex: 0,
         fragment: fragment ?? undefined,
@@ -1426,7 +2168,7 @@ const EpubReaderV2Inner = forwardRef<
       setTocOpen(false)
       setSettingsOpen(false)
     },
-    [publication, spineIndex, goToAnchorInCurrentDoc, loadSpine],
+    [publication, spineIndex, spineIndexByPath, goToAnchorInCurrentDoc, loadSpine],
   )
 
   const goToPage = useCallback(
@@ -1607,6 +2349,111 @@ const EpubReaderV2Inner = forwardRef<
   prevRef.current = prev
   showHudRef.current = showHud
 
+  const waitForSettledLayout = useCallback(async (options?: { timeoutMs?: number }) => {
+    if (typeof window === 'undefined') return
+    const timeoutMs = Math.max(0, Number(options?.timeoutMs ?? 1200))
+    const start = typeof performance !== 'undefined' ? performance.now() : Date.now()
+    const nextFrame = () => new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()))
+
+    // Give React/layout a frame to apply pending size changes before sampling.
+    await nextFrame()
+
+    // Wait for any reflow/restore (e.g. panel resize) to finish.
+    while (suppressPersistRef.current || !appliedLayoutRef.current || !iframeDocRef.current) {
+      const now = typeof performance !== 'undefined' ? performance.now() : Date.now()
+      if (timeoutMs && now - start > timeoutMs) break
+      await nextFrame()
+    }
+
+    // Give the browser a frame to paint after scroll/layout settle.
+    await nextFrame()
+  }, [])
+
+  const computeVisiblePage = useCallback((): EpubReaderV2VisiblePage | null => {
+    const pub = publicationRef.current
+    const doc = iframeDocRef.current
+    const layout = appliedLayoutRef.current
+    if (!pub || !doc || !layout) return null
+
+    const loc = locationRef.current
+    const spineIndex = clamp(
+      loc?.spineIndex ?? 0,
+      0,
+      Math.max(0, pub.spine.length - 1),
+    )
+    const href = String(pub.spine[spineIndex]?.href ?? '').trim()
+
+    const flowMode = settingsRef.current.flowMode
+    const chapterTotalPages = flowMode === 'paginated' ? layout.totalPages : 1
+
+    const rawPageIndex =
+      flowMode === 'paginated'
+        ? layout.viewportEl.scrollLeft / Math.max(1, layout.pageWidth)
+        : 0
+    const pageIndex =
+      flowMode === 'paginated'
+        ? clamp(
+            Math.round(rawPageIndex),
+            0,
+            Math.max(0, layout.totalPages - 1),
+          )
+        : 0
+
+    const text = extractVisibleText({
+      doc,
+      layout,
+      flowMode,
+      maxChars: 8000,
+    })
+
+    return {
+      href,
+      spineIndex,
+      pageIndex,
+      chapterTotalPages,
+      text,
+    }
+  }, [])
+
+  const computeVisiblePageParts = useCallback(
+    async (options?: {
+      maxChars?: number
+      maxImages?: number
+      maxImageBytes?: number
+    }): Promise<Array<TextPart | ImagePart> | null> => {
+      const pub = publicationRef.current
+      const doc = iframeDocRef.current
+      const layout = appliedLayoutRef.current
+      const store = resourceStoreRef.current
+      if (!pub || !doc || !layout) return null
+
+      const loc = locationRef.current
+      const spineIndex = clamp(
+        loc?.spineIndex ?? 0,
+        0,
+        Math.max(0, pub.spine.length - 1),
+      )
+      const href = String(pub.spine[spineIndex]?.href ?? '').trim()
+      if (!href) return null
+
+      const flowMode = settingsRef.current.flowMode
+
+      return await extractVisibleParts({
+        doc,
+        layout,
+        flowMode,
+        store,
+        maxChars: Math.max(1, Number(options?.maxChars ?? 8000)),
+        maxImages: Math.max(0, Number(options?.maxImages ?? 3)),
+        maxImageBytes: Math.max(
+          1,
+          Number(options?.maxImageBytes ?? 1_500_000),
+        ),
+      })
+    },
+    [],
+  )
+
   useImperativeHandle(
     ref,
     () => ({
@@ -1615,52 +2462,15 @@ const EpubReaderV2Inner = forwardRef<
       goToHref,
       setSettings: updateSettings,
       getSettings: () => settings,
-      getVisiblePage: () => {
-        const pub = publicationRef.current
-        const doc = iframeDocRef.current
-        const layout = appliedLayoutRef.current
-        if (!pub || !doc || !layout) return null
-
-        const loc = locationRef.current
-        const spineIndex = clamp(
-          loc?.spineIndex ?? 0,
-          0,
-          Math.max(0, pub.spine.length - 1),
-        )
-        const href = String(pub.spine[spineIndex]?.href ?? '').trim()
-
-        const flowMode = settingsRef.current.flowMode
-        const chapterTotalPages =
-          flowMode === 'paginated' ? layout.totalPages : 1
-
-        const rawPageIndex =
-          flowMode === 'paginated'
-            ? layout.viewportEl.scrollLeft / Math.max(1, layout.pageWidth)
-            : 0
-        const pageIndex =
-          flowMode === 'paginated'
-            ? clamp(
-                Math.round(rawPageIndex),
-                0,
-                Math.max(0, layout.totalPages - 1),
-              )
-            : 0
-
-        const text = extractVisibleText({
-          doc,
-          layout,
-          flowMode,
-          pageIndex,
-          maxChars: 8000,
-        })
-
-        return {
-          href,
-          spineIndex,
-          pageIndex,
-          chapterTotalPages,
-          text,
-        }
+      getVisiblePage: computeVisiblePage,
+      getVisiblePageStable: async (options) => {
+        await waitForSettledLayout(options)
+        return computeVisiblePage()
+      },
+      getVisiblePageParts: computeVisiblePageParts,
+      getVisiblePagePartsStable: async (options) => {
+        await waitForSettledLayout({ timeoutMs: options?.timeoutMs })
+        return await computeVisiblePageParts(options)
       },
       getSpineItemText: async (options) => {
         const pub = publicationRef.current
@@ -1680,6 +2490,33 @@ const EpubReaderV2Inner = forwardRef<
           return extractSpineItemText({
             xhtmlText,
             maxChars: Math.max(1, Number(options?.maxChars ?? 18_000)),
+          })
+        } catch {
+          return null
+        }
+      },
+      getSpineItemParts: async (options) => {
+        const pub = publicationRef.current
+        const store = resourceStoreRef.current
+        if (!pub || !store) return null
+
+        const spineIndex = clamp(
+          Number(options?.spineIndex ?? 0),
+          0,
+          Math.max(0, pub.spine.length - 1),
+        )
+        const href = String(pub.spine[spineIndex]?.href ?? '').trim()
+        if (!href) return null
+
+        try {
+          const xhtmlText = await store.readText(href)
+          return await extractSpineItemParts({
+            xhtmlText,
+            xhtmlPath: href,
+            store,
+            maxChars: Math.max(1, Number(options?.maxChars ?? 18_000)),
+            maxImages: Math.max(0, Number(options?.maxImages ?? 6)),
+            maxImageBytes: Math.max(1, Number(options?.maxImageBytes ?? 1_500_000)),
           })
         } catch {
           return null
@@ -2277,12 +3114,7 @@ const EpubReaderV2Inner = forwardRef<
       const href = pub.spine[spineIndex]?.href ?? ''
       if (!href) return null
       const normalizedHref = normalizePath(splitHref(href).path)
-      const tocFlat = flattenToc(pub.toc ?? [])
-      const item = tocFlat.find(
-        ({ item }) =>
-          normalizePath(splitHref(item.href).path) === normalizedHref,
-      )?.item
-      const title = (item?.title ?? '').trim()
+      const title = tocTitleByPath.get(normalizedHref) ?? ''
       return title || null
     }
 
@@ -2406,8 +3238,8 @@ const EpubReaderV2Inner = forwardRef<
           return
         }
         if (
-          /^[a-zA-Z][a-zA-Z\d+\-.]*:/.test(rawHref) &&
-          !rawHref.toLowerCase().startsWith('epubcfi(')
+          hasUrlScheme(rawHref) &&
+          !isEpubCfiHref(rawHref)
         ) {
           event.preventDefault()
           return
@@ -2904,9 +3736,7 @@ const EpubReaderV2Inner = forwardRef<
         if (!title) return null
 
         const path = normalizePath(splitHref(href).path)
-        const spineIndex = pub.spine.findIndex(
-          (s) => normalizePath(s.href) === path,
-        )
+        const spineIndex = spineIndexByPath.get(path) ?? -1
         if (spineIndex < 0) return null
         return { title, href, spineIndex, depth }
       })
@@ -2918,7 +3748,7 @@ const EpubReaderV2Inner = forwardRef<
     }>
 
     cb({ bookId, bookTitle, metadata, chapters })
-  }, [publication, baseStorageId, tocItemsFlat, variant])
+  }, [publication, baseStorageId, tocItemsFlat, spineIndexByPath, variant])
 
   const currentHref = publication?.spine[spineIndex]?.href ?? ''
   const chromeTitle = publication?.title ?? 'EPUB'

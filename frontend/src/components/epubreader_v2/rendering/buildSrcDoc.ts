@@ -1,5 +1,7 @@
-import { resolveRelativePath, splitHref } from '../utils/path';
+import { hasUrlScheme } from '../utils/path';
+import { isAllowedInlineUrl, isEpubCfiHref } from '../utils/url';
 import { EpubResourceStore } from './resources';
+import { ensureReaderContainers } from './containers';
 
 const BASE_CSP = [
   "default-src 'none'",
@@ -105,19 +107,31 @@ function sanitizeAnchor(el: Element) {
   if (!(el instanceof HTMLAnchorElement)) return;
   const href = (el.getAttribute('href') ?? '').trim();
   if (!href) return;
-  if (/^[a-zA-Z][a-zA-Z\d+\-.]*:/.test(href) && !href.toLowerCase().startsWith('epubcfi(')) {
+  if (hasUrlScheme(href) && !isEpubCfiHref(href)) {
     el.setAttribute('href', '#');
     el.setAttribute('data-mf-blocked-href', href);
   }
 }
 
-function stripQuery(path: string): string {
-  const idx = path.indexOf('?');
-  return idx === -1 ? path : path.slice(0, idx);
-}
-
-function isAllowedInlineUrl(url: string): boolean {
-  return url.startsWith('data:') || url.startsWith('blob:');
+async function resolveObjectUrl(options: {
+  basePath: string;
+  href: string;
+  store: EpubResourceStore;
+}): Promise<{ url: string; epubPath: string } | null> {
+  const resolved = options.store.resolveEpubHref({
+    basePath: options.basePath,
+    href: options.href,
+  });
+  if (!resolved) return null;
+  try {
+    const blobUrl = await options.store.getObjectUrl(resolved.path);
+    return {
+      url: resolved.fragment ? `${blobUrl}#${resolved.fragment}` : blobUrl,
+      epubPath: resolved.path,
+    };
+  } catch {
+    return null;
+  }
 }
 
 async function rewriteSrcset(docPath: string, rawSrcset: string, store: EpubResourceStore): Promise<string> {
@@ -129,7 +143,7 @@ async function rewriteSrcset(docPath: string, rawSrcset: string, store: EpubReso
   for (const part of parts) {
     const [urlPart, descriptor] = part.split(/\s+/, 2);
     if (!urlPart) continue;
-    if (/^[a-zA-Z][a-zA-Z\d+\-.]*:/.test(urlPart)) {
+    if (hasUrlScheme(urlPart)) {
       if (isAllowedInlineUrl(urlPart)) out.push(descriptor ? `${urlPart} ${descriptor}` : urlPart);
       continue;
     }
@@ -137,15 +151,9 @@ async function rewriteSrcset(docPath: string, rawSrcset: string, store: EpubReso
       out.push(descriptor ? `${urlPart} ${descriptor}` : urlPart);
       continue;
     }
-    const { path, fragment } = splitHref(urlPart);
-    const resolved = resolveRelativePath(docPath, stripQuery(path));
-    try {
-      const blobUrl = await store.getObjectUrl(resolved);
-      const rewritten = fragment ? `${blobUrl}#${fragment}` : blobUrl;
-      out.push(descriptor ? `${rewritten} ${descriptor}` : rewritten);
-    } catch {
-      // Drop broken candidates to avoid leaking network requests in srcdoc.
-    }
+    const rewritten = await resolveObjectUrl({ basePath: docPath, href: urlPart, store });
+    if (!rewritten) continue;
+    out.push(descriptor ? `${rewritten.url} ${descriptor}` : rewritten.url);
   }
   return out.join(', ');
 }
@@ -162,12 +170,12 @@ export async function buildSpineItemSrcDoc(options: {
 
   for (const link of Array.from(doc.querySelectorAll('link[rel~="stylesheet"][href]'))) {
     const rawHref = link.getAttribute('href') ?? '';
-    const { path } = splitHref(rawHref);
-    if (!path || /^[a-zA-Z][a-zA-Z\d+\-.]*:/.test(path)) {
+    const resolved = resourceStore.resolveEpubHref({ basePath: spineItemPath, href: rawHref });
+    if (!resolved) {
       link.remove();
       continue;
     }
-    const resolvedCssPath = resolveRelativePath(spineItemPath, path);
+    const resolvedCssPath = resolved.path;
     try {
       const cssText = await resourceStore.readText(resolvedCssPath);
       const rewritten = await resourceStore.rewriteCssUrls(cssText, resolvedCssPath);
@@ -216,19 +224,24 @@ export async function buildSpineItemSrcDoc(options: {
     const attr = el.hasAttribute('poster') ? 'poster' : 'src';
     const raw = (el.getAttribute(attr) ?? '').trim();
     if (!raw) continue;
-    if (/^[a-zA-Z][a-zA-Z\d+\-.]*:/.test(raw)) {
+    if (hasUrlScheme(raw)) {
       if (!isAllowedInlineUrl(raw)) el.removeAttribute(attr);
       continue;
     }
     if (isAllowedInlineUrl(raw)) continue;
-    const { path, fragment } = splitHref(raw);
-    const resolved = resolveRelativePath(spineItemPath, stripQuery(path));
-    try {
-      const url = await resourceStore.getObjectUrl(resolved);
-      el.setAttribute(attr, fragment ? `${url}#${fragment}` : url);
-    } catch {
+    const resolved = await resolveObjectUrl({
+      basePath: spineItemPath,
+      href: raw,
+      store: resourceStore,
+    });
+    if (!resolved) {
       el.removeAttribute(attr);
+      continue;
     }
+    if (el instanceof HTMLImageElement) {
+      el.setAttribute('data-mfv2-epub-src', resolved.epubPath);
+    }
+    el.setAttribute(attr, resolved.url);
 
     if (el instanceof HTMLImageElement) {
       el.loading = 'eager';
@@ -252,19 +265,21 @@ export async function buildSpineItemSrcDoc(options: {
     const attr = image.getAttribute('href') ? 'href' : 'xlink:href';
     const raw = (image.getAttribute(attr) ?? '').trim();
     if (!raw) continue;
-    if (/^[a-zA-Z][a-zA-Z\d+\-.]*:/.test(raw)) {
+    if (hasUrlScheme(raw)) {
       if (!isAllowedInlineUrl(raw)) image.removeAttribute(attr);
       continue;
     }
     if (isAllowedInlineUrl(raw)) continue;
-    const { path, fragment } = splitHref(raw);
-    const resolved = resolveRelativePath(spineItemPath, stripQuery(path));
-    try {
-      const url = await resourceStore.getObjectUrl(resolved);
-      image.setAttribute(attr, fragment ? `${url}#${fragment}` : url);
-    } catch {
+    const resolved = await resolveObjectUrl({
+      basePath: spineItemPath,
+      href: raw,
+      store: resourceStore,
+    });
+    if (!resolved) {
       image.removeAttribute(attr);
+      continue;
     }
+    image.setAttribute(attr, resolved.url);
   }
 
   const head = doc.head ?? doc.getElementsByTagName('head')[0] ?? doc.documentElement;
@@ -284,14 +299,7 @@ export async function buildSpineItemSrcDoc(options: {
   baseStyleEl.textContent = BASE_STYLE;
   head.appendChild(baseStyleEl);
 
-  const body = doc.body ?? doc.getElementsByTagName('body')[0] ?? doc.documentElement;
-  const viewport = doc.createElement('div');
-  viewport.id = 'mfv2-viewport';
-  const content = doc.createElement('div');
-  content.id = 'mfv2-book-content';
-  while (body.firstChild) content.appendChild(body.firstChild);
-  viewport.appendChild(content);
-  body.appendChild(viewport);
+  ensureReaderContainers(doc);
 
   return `<!doctype html>${doc.documentElement.outerHTML}`;
 }

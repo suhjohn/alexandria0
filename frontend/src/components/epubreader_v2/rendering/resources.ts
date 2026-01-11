@@ -1,9 +1,12 @@
 import { decodeText } from '../utils/text';
-import { normalizePath, resolveRelativePath, splitHref } from '../utils/path';
+import { hasUrlScheme, normalizePath, resolveRelativePath, splitHref, stripQuery } from '../utils/path';
+import { isAllowedInlineUrl } from '../utils/url';
 
 type ZipLike = {
   read(path: string): Promise<Uint8Array>;
 };
+
+export type ResolvedEpubHref = { path: string; fragment?: string };
 
 const EXT_TO_MIME: Record<string, string> = {
   '.css': 'text/css',
@@ -54,6 +57,19 @@ export class EpubResourceStore {
     return decodeText(bytes);
   }
 
+  async readBytes(path: string): Promise<Uint8Array> {
+    const canonical = this.resolvePath(path);
+    const bytes = await this.zip.read(canonical);
+    const copy = new Uint8Array(bytes.byteLength);
+    copy.set(bytes);
+    return copy;
+  }
+
+  getMediaType(path: string): string {
+    const canonical = this.resolvePath(path);
+    return this.mediaTypeByPath.get(canonical) ?? guessMimeType(canonical);
+  }
+
   async getObjectUrl(path: string): Promise<string> {
     const normalized = this.resolvePath(path);
     const existing = this.urlByPath.get(normalized);
@@ -66,6 +82,33 @@ export class EpubResourceStore {
     const url = URL.createObjectURL(blob);
     this.urlByPath.set(normalized, url);
     return url;
+  }
+
+  hasPath(path: string): boolean {
+    const normalized = normalizePath(stripQuery(path));
+    if (!normalized) return false;
+    const canonical = this.resolvePath(normalized);
+    return this.canonicalPathByAlias.has(canonical) || this.canonicalPathByAlias.has(canonical.toLowerCase());
+  }
+
+  resolveEpubHref(options: { basePath: string; href: string }): ResolvedEpubHref | null {
+    const rawHref = String(options.href ?? '').trim();
+    if (!rawHref) return null;
+
+    // Preserve in-document fragments like url(#filter) or href="#note-1".
+    if (rawHref.startsWith('#')) return null;
+
+    if (hasUrlScheme(rawHref)) return null;
+    if (isAllowedInlineUrl(rawHref)) return null;
+
+    const { path, fragment } = splitHref(rawHref);
+    const normalizedPath = normalizePath(stripQuery(path));
+    if (!normalizedPath) return null;
+
+    const basePath = String(options.basePath ?? '').trim();
+    const resolved = this.hasPath(normalizedPath) ? normalizedPath : resolveRelativePath(basePath, normalizedPath);
+    const canonical = this.resolvePath(resolved);
+    return { path: canonical, fragment };
   }
 
   revokeAll() {
@@ -90,12 +133,11 @@ export class EpubResourceStore {
       for (const imp of imports) {
         out += css.slice(last, imp.start);
         last = imp.end;
-        const { path } = splitHref(imp.href);
-        if (!path || /^[a-zA-Z][a-zA-Z\d+\-.]*:/.test(path)) continue;
-        const resolved = resolveRelativePath(cssPath, path);
+        const resolved = this.resolveEpubHref({ basePath: cssPath, href: imp.href });
+        if (!resolved) continue;
         try {
-          const importedCss = await this.readText(resolved);
-          const processed = await this.rewriteCssUrls(importedCss, resolved, depth + 1);
+          const importedCss = await this.readText(resolved.path);
+          const processed = await this.rewriteCssUrls(importedCss, resolved.path, depth + 1);
           out += processed;
         } catch {
           // Ignore broken imports.
@@ -119,19 +161,23 @@ export class EpubResourceStore {
       out += css.slice(last, m.start);
       last = m.end;
       const raw = m.rawUrl.trim();
-      if (!raw || raw.startsWith('data:') || raw.startsWith('blob:') || /^[a-zA-Z][a-zA-Z\d+\-.]*:/.test(raw)) {
-        if (/^[a-zA-Z][a-zA-Z\d+\-.]*:/.test(raw) && !raw.startsWith('data:') && !raw.startsWith('blob:')) {
+      if (!raw || raw.startsWith('#') || isAllowedInlineUrl(raw) || hasUrlScheme(raw)) {
+        if (hasUrlScheme(raw) && !isAllowedInlineUrl(raw)) {
           out += `url("")`;
         } else {
           out += `url(${raw})`;
         }
         continue;
       }
-      const { path, fragment } = splitHref(raw);
-      const resolved = resolveRelativePath(cssPath, stripQuery(path));
+
+      const resolved = this.resolveEpubHref({ basePath: cssPath, href: raw });
+      if (!resolved) {
+        out += `url(${raw})`;
+        continue;
+      }
       try {
-        const url = await this.getObjectUrl(resolved);
-        out += fragment ? `url(${url}#${fragment})` : `url(${url})`;
+        const url = await this.getObjectUrl(resolved.path);
+        out += resolved.fragment ? `url(${url}#${resolved.fragment})` : `url(${url})`;
       } catch {
         out += `url(${raw})`;
       }
@@ -172,11 +218,6 @@ export class EpubResourceStore {
 
     return normalized;
   }
-}
-
-function stripQuery(path: string): string {
-  const idx = path.indexOf('?');
-  return idx === -1 ? path : path.slice(0, idx);
 }
 
 function decodePathSegments(path: string): string {
