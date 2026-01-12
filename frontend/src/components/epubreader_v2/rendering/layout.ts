@@ -9,6 +9,15 @@ export type AppliedLayout = {
   totalPages: number
 }
 
+function getZoomScale(doc: Document, fontScale: number): number {
+  const win = doc.defaultView
+  const supportsZoom =
+    typeof win?.CSS?.supports === 'function' && win.CSS.supports('zoom', '1')
+  if (!supportsZoom) return 1
+  if (!Number.isFinite(fontScale) || fontScale <= 0) return 1
+  return fontScale
+}
+
 function themeVars(themePreset: EpubReaderV2ThemePreset): {
   bg: string
   fg: string
@@ -28,8 +37,21 @@ export function applyReaderLayout(options: {
   viewportWidth: number
   viewportHeight: number
   settings: EpubReaderV2Settings
+  safeArea?: {
+    topPx?: number
+    bottomPx?: number
+  }
 }): AppliedLayout {
   const { doc, viewportWidth, viewportHeight, settings } = options
+  const rawSafeTopPx = Number(options.safeArea?.topPx ?? 0)
+  const rawSafeBottomPx = Number(options.safeArea?.bottomPx ?? 0)
+  const safeTopPx = Number.isFinite(rawSafeTopPx)
+    ? Math.max(0, rawSafeTopPx)
+    : 0
+  const safeBottomPx = Number.isFinite(rawSafeBottomPx)
+    ? Math.max(0, rawSafeBottomPx)
+    : 0
+  const zoomScale = getZoomScale(doc, settings.fontScale)
 
   const root = doc.documentElement
   root.setAttribute('data-mfv2-font-family', settings.fontFamily)
@@ -43,6 +65,11 @@ export function applyReaderLayout(options: {
     '--mfv2-text-align',
     settings.textAlign === 'auto' ? 'initial' : settings.textAlign,
   )
+  // Safe areas are in outer (un-zoomed) pixels. When the browser applies font
+  // scaling via `zoom`, convert to the iframe's un-zoomed coordinate space so
+  // the effective visible safe area remains stable.
+  root.style.setProperty('--mfv2-safe-top', `${safeTopPx / zoomScale}px`)
+  root.style.setProperty('--mfv2-safe-bottom', `${safeBottomPx / zoomScale}px`)
 
   if (settings.fontFamily === 'serif') {
     root.style.setProperty(
@@ -81,10 +108,13 @@ export function applyReaderLayout(options: {
     contentEl.style.height = 'auto'
     contentEl.style.width = '100%'
   } else {
+    const layoutWidth = viewportWidth / zoomScale
+    const layoutHeight = viewportHeight / zoomScale
+    const layoutGap = settings.columnGapPx / zoomScale
     viewportEl.style.overflow = 'hidden'
-    contentEl.style.height = `${viewportHeight}px`
-    contentEl.style.columnWidth = `${viewportWidth}px`
-    contentEl.style.columnGap = `${settings.columnGapPx}px`
+    contentEl.style.height = `${layoutHeight}px`
+    contentEl.style.columnWidth = `${layoutWidth}px`
+    contentEl.style.columnGap = `${layoutGap}px`
     contentEl.style.columnFill = 'auto'
     contentEl.style.width = 'auto'
   }
@@ -95,7 +125,9 @@ export function applyReaderLayout(options: {
   const pageWidth = viewportWidth + settings.columnGapPx
   const totalPages = (() => {
     if (settings.flowMode !== 'paginated') return 1
-    const raw = (contentEl.scrollWidth + settings.columnGapPx) / pageWidth
+    // Use the scroll container's width so `zoom`-scaled content is measured in
+    // the same coordinate space as `scrollLeft` and `clientWidth`.
+    const raw = (viewportEl.scrollWidth + settings.columnGapPx) / pageWidth
     const nearest = Math.max(1, Math.round(raw))
     if (Math.abs(raw - nearest) < 0.02) return nearest
     return Math.max(1, Math.ceil(raw))

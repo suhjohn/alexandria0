@@ -28,6 +28,8 @@ const BASE_STYLE = `
   --mfv2-line-height: 1.5;
   --mfv2-font-family: inherit;
   --mfv2-text-align: initial;
+  --mfv2-safe-top: 0px;
+  --mfv2-safe-bottom: 0px;
 }
 
 html, body {
@@ -69,6 +71,9 @@ a:not([href]) { color: inherit; text-decoration: inherit; }
   column-width: var(--mfv2-vw);
   column-gap: var(--mfv2-gap);
   column-fill: auto;
+  box-sizing: border-box;
+  padding-top: var(--mfv2-safe-top);
+  padding-bottom: var(--mfv2-safe-bottom);
 }
 
 /*

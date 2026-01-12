@@ -36,7 +36,12 @@ import {
   type AppliedLayout,
 } from './rendering/layout'
 import { IoList } from 'react-icons/io5'
-import { hasUrlScheme, normalizePath, resolveRelativePath, splitHref } from './utils/path'
+import {
+  hasUrlScheme,
+  normalizePath,
+  resolveRelativePath,
+  splitHref,
+} from './utils/path'
 import { isEpubCfiHref } from './utils/url'
 import { EpubResourceStore } from './rendering/resources'
 import { setReaderSettings, useReaderSettings } from '@/lib/reader-settings'
@@ -60,7 +65,9 @@ export type EpubReaderV2Handle = {
   setSettings: (settings: Partial<EpubReaderV2Settings>) => void
   getSettings: () => EpubReaderV2Settings
   getVisiblePage: () => EpubReaderV2VisiblePage | null
-  getVisiblePageStable: (options?: { timeoutMs?: number }) => Promise<EpubReaderV2VisiblePage | null>
+  getVisiblePageStable: (options?: {
+    timeoutMs?: number
+  }) => Promise<EpubReaderV2VisiblePage | null>
   getVisiblePageParts: (options?: {
     maxChars?: number
     maxImages?: number
@@ -153,6 +160,39 @@ function normalizeVisibleText(text: string): string {
     .trim()
 }
 
+function takeFirstSentenceSnippet(text: string, maxChars: number): string {
+  const cleaned = normalizeVisibleText(text).replace(/\s+/g, ' ').trim()
+  if (!cleaned) return ''
+  if (cleaned.length <= maxChars) return cleaned
+  const window = cleaned.slice(0, Math.max(0, maxChars))
+  const m = /[.!?]["')\]]?\s/.exec(window)
+  if (m && typeof m.index === 'number' && m.index >= 40) {
+    const end = m.index + 1
+    return cleaned.slice(0, Math.min(cleaned.length, end)).trim()
+  }
+  return window.trim()
+}
+
+function takeLastSentenceSnippet(text: string, maxChars: number): string {
+  const cleaned = normalizeVisibleText(text).replace(/\s+/g, ' ').trim()
+  if (!cleaned) return ''
+  if (cleaned.length <= maxChars) return cleaned
+  const start = Math.max(0, cleaned.length - maxChars)
+  const window = cleaned.slice(start)
+  // Find a sentence boundary within the window and return the tail sentence.
+  const re = /[.!?]["')\]]?\s/g
+  let lastIdx: number | null = null
+  for (;;) {
+    const m = re.exec(window)
+    if (!m) break
+    lastIdx = m.index
+  }
+  if (lastIdx != null && lastIdx >= 0 && lastIdx < window.length - 1) {
+    return window.slice(lastIdx + 1).trim()
+  }
+  return window.trim()
+}
+
 function normalizeSearchText(text: string): string {
   return String(text ?? '')
     .replace(/\s+/g, ' ')
@@ -187,6 +227,22 @@ function debugReaderNav(...args: Array<unknown>) {
   if (!isReaderNavDebugEnabled()) return
   // eslint-disable-next-line no-console
   console.log('[mfv2][readerNav]', ...args)
+}
+
+function isReaderVisibleTextDebugEnabled() {
+  if (typeof window === 'undefined') return false
+  if ((window as any).__MFV2_DEBUG_VISIBLE_TEXT) return true
+  try {
+    return window.localStorage?.getItem('mfv2_debug_visible_text') === '1'
+  } catch {
+    return false
+  }
+}
+
+function debugReaderVisibleText(...args: Array<unknown>) {
+  if (!isReaderVisibleTextDebugEnabled()) return
+  // eslint-disable-next-line no-console
+  console.log('[mfv2][visibleText]', ...args)
 }
 
 type CaretPoint = { node: Text; offset: number }
@@ -268,36 +324,70 @@ function extractVisibleTextByCaret(options: {
     return null
   }
 
+  const getRectNearTextOffset = (
+    node: Text,
+    offset: number,
+  ): DOMRect | null => {
+    try {
+      const value = node.nodeValue ?? ''
+      const len = value.length
+      if (len <= 0) return null
+
+      const pivot = clamp(Math.floor(offset), 0, Math.max(0, len - 1))
+      const isWhitespaceChar = (ch: string) => /\s/.test(ch)
+
+      const getRectFor = (start: number, end: number): DOMRect | null => {
+        const range = doc.createRange()
+        try {
+          range.setStart(node, clamp(start, 0, len))
+          range.setEnd(node, clamp(end, 0, len))
+        } catch {
+          return null
+        }
+        const rects = Array.from(range.getClientRects?.() ?? [])
+        const rect =
+          rects.find((r) => r.width > 0 || r.height > 0) ?? rects[0] ?? null
+        if (rect && (rect.width > 0 || rect.height > 0)) return rect
+        const fallback = range.getBoundingClientRect?.() ?? null
+        if (fallback && (fallback.width > 0 || fallback.height > 0))
+          return fallback
+        return null
+      }
+
+      // Prefer an actual glyph rect near the caret; line-end or whitespace
+      // carets often produce empty client rects.
+      const maxStep = 48
+      for (let step = 0; step <= maxStep; step++) {
+        const candidates = step === 0 ? [pivot] : [pivot + step, pivot - step]
+        for (const idx of candidates) {
+          if (idx < 0 || idx >= len) continue
+          if (step < maxStep && isWhitespaceChar(value[idx] ?? '')) continue
+          const rect = getRectFor(idx, idx + 1)
+          if (rect) return rect
+        }
+      }
+
+      // As a last resort, try a small window (helps with runs of whitespace).
+      const windowEnd = clamp(pivot + 16, 0, len)
+      return getRectFor(pivot, windowEnd)
+    } catch {
+      return null
+    }
+  }
+
   const isCaretPointVisible = (point: CaretPoint) => {
     const parent = point.node.parentElement
     if (!parent || !layout.contentEl.contains(parent)) return false
     try {
-      const len = point.node.nodeValue?.length ?? 0
-      let startOffset = point.offset
-      let endOffset = point.offset
-      if (len <= 0) return false
-      if (point.offset < len) {
-        endOffset = point.offset + 1
-      } else if (point.offset > 0) {
-        startOffset = point.offset - 1
-      } else {
-        return false
-      }
-
-      const range = doc.createRange()
-      range.setStart(point.node, clamp(startOffset, 0, len))
-      range.setEnd(point.node, clamp(endOffset, 0, len))
-      const rects = Array.from(range.getClientRects?.() ?? [])
-      for (const rect of rects) {
-        if (rect.height < 1 || rect.width < 1) continue
-        const overlaps =
-          rect.bottom >= viewportRect.top - marginY &&
-          rect.top <= viewportRect.bottom + marginY &&
-          rect.right >= viewportRect.left - marginX &&
-          rect.left <= viewportRect.right + marginX
-        if (overlaps) return true
-      }
-      return false
+      const rect = getRectNearTextOffset(point.node, point.offset)
+      if (!rect) return false
+      if (rect.height < 1 || rect.width < 1) return false
+      return (
+        rect.bottom >= viewportRect.top - marginY &&
+        rect.top <= viewportRect.bottom + marginY &&
+        rect.right >= viewportRect.left - marginX &&
+        rect.left <= viewportRect.right + marginX
+      )
     } catch {
       return false
     }
@@ -324,36 +414,268 @@ function extractVisibleTextByCaret(options: {
       right,
     ]
 
+    const pushPoint = (point: CaretPoint | null) => {
+      if (!point) return
+      if (!isCaretPointVisible(point)) return
+      points.push(point)
+    }
+
     const points: Array<CaretPoint> = []
-    const stepY = 22
-    for (let y = top; y <= bottom; y += stepY) {
+
+    // Smaller step catches bottom-of-page lines that can otherwise be missed.
+    const stepY = 14
+    const yCandidates: number[] = []
+    for (let y = top; y <= bottom; y += stepY) yCandidates.push(y)
+
+    // Always sample very close to the edges too; otherwise we can miss the last
+    // 1–2 visible lines when the step doesn't land near the bottom.
+    yCandidates.push(
+      top + 1,
+      top + 4,
+      bottom - 1,
+      bottom - 4,
+      viewportRect.bottom - 1,
+    )
+
+    const uniqY = Array.from(
+      new Set(
+        yCandidates.map((y) =>
+          Math.round(clamp(y, viewportRect.top, viewportRect.bottom)),
+        ),
+      ),
+    ).sort((a, b) => a - b)
+
+    for (const y of uniqY) {
       for (const x of xCandidates) {
         const raw = caretAtPoint(x, y)
-        const point = normalizeCaret(raw, 'forward')
-        if (!point) continue
-        if (!isCaretPointVisible(point)) continue
-        points.push(point)
+
+        // Use forward normalization for earlier points (start of visible text)
+        // and backward normalization for later points (end of visible text).
+        pushPoint(normalizeCaret(raw, 'forward'))
+        pushPoint(normalizeCaret(raw, 'backward'))
       }
     }
 
     return points
   }
 
-  const caretPoints = collectVisibleCaretPoints()
-  if (caretPoints.length === 0) return null
+  const findEdgeCaretPoint = (which: 'start' | 'end'): CaretPoint | null => {
+    const left = viewportRect.left + 8
+    const right = viewportRect.right - 8
+    const top = viewportRect.top + 8
+    const bottom = viewportRect.bottom - 8
+    const center = left + (right - left) * 0.5
+    const xs = [
+      center,
+      left + (right - left) * 0.25,
+      left + (right - left) * 0.75,
+    ]
 
-  let start = caretPoints[0]!
-  let end = caretPoints[0]!
+    const stepY = 10
+    if (which === 'start') {
+      for (let y = top + 1; y <= bottom - 1; y += stepY) {
+        for (const x of xs) {
+          const raw = caretAtPoint(x, y)
+          const point = normalizeCaret(raw, 'forward')
+          if (!point) continue
+          if (!isCaretPointVisible(point)) continue
+          return point
+        }
+      }
+      return null
+    }
+
+    for (let y = bottom - 1; y >= top + 1; y -= stepY) {
+      for (const x of xs) {
+        const raw = caretAtPoint(x, y)
+        const point = normalizeCaret(raw, 'backward')
+        if (!point) continue
+        if (!isCaretPointVisible(point)) continue
+        return point
+      }
+    }
+    return null
+  }
+
+  const caretPoints = collectVisibleCaretPoints()
+  if (caretPoints.length === 0) {
+    debugReaderVisibleText('noCaretPoints', {
+      viewport: {
+        top: Math.round(viewportRect.top),
+        left: Math.round(viewportRect.left),
+        bottom: Math.round(viewportRect.bottom),
+        right: Math.round(viewportRect.right),
+      },
+      scrollLeft: Math.round(viewportEl.scrollLeft),
+      scrollTop: Math.round(viewportEl.scrollTop),
+      clientWidth: Math.round(viewportEl.clientWidth),
+      clientHeight: Math.round(viewportEl.clientHeight),
+    })
+    return null
+  }
+
+  const edgeStart = findEdgeCaretPoint('start')
+  const edgeEnd = findEdgeCaretPoint('end')
+
+  let start = edgeStart ?? caretPoints[0]!
+  let end = edgeEnd ?? caretPoints[0]!
+
   for (const p of caretPoints) {
-    if (compareCaret(p, start) < 0) start = p
-    if (compareCaret(p, end) > 0) end = p
+    if (!edgeStart && compareCaret(p, start) < 0) start = p
+    if (!edgeEnd && compareCaret(p, end) > 0) end = p
+  }
+
+  // If edge detection got confused (can happen in large blank regions), fall
+  // back to min/max sampling.
+  if (compareCaret(start, end) > 0) {
+    start = caretPoints[0]!
+    end = caretPoints[0]!
+    for (const p of caretPoints) {
+      if (compareCaret(p, start) < 0) start = p
+      if (compareCaret(p, end) > 0) end = p
+    }
+  }
+
+  const expandCaretWithin = (
+    root: ParentNode,
+    point: CaretPoint,
+    deltaChars: number,
+  ): CaretPoint => {
+    const value = point.node.nodeValue ?? ''
+    const len = value.length
+    const clampedOffset = clamp(Math.floor(point.offset), 0, len)
+
+    const walker = doc.createTreeWalker(root, NodeFilter.SHOW_TEXT)
+    try {
+      walker.currentNode = point.node
+    } catch {
+      return { node: point.node, offset: clampedOffset }
+    }
+
+    if (deltaChars === 0) return { node: point.node, offset: clampedOffset }
+
+    if (deltaChars < 0) {
+      let remaining = Math.abs(deltaChars)
+      let node: Text = point.node
+      let offset = clampedOffset
+      while (remaining > 0) {
+        if (offset > 0) {
+          const step = Math.min(offset, remaining)
+          offset -= step
+          remaining -= step
+          if (remaining <= 0) break
+        }
+        const prev = walker.previousNode() as Text | null
+        if (!prev) break
+        node = prev
+        offset = (node.nodeValue ?? '').length
+      }
+      return { node, offset }
+    }
+
+    let remaining = Math.abs(deltaChars)
+    let node: Text = point.node
+    let offset = clampedOffset
+    while (remaining > 0) {
+      const nodeLen = (node.nodeValue ?? '').length
+      if (offset < nodeLen) {
+        const step = Math.min(nodeLen - offset, remaining)
+        offset += step
+        remaining -= step
+        if (remaining <= 0) break
+      }
+      const next = walker.nextNode() as Text | null
+      if (!next) break
+      node = next
+      offset = 0
+    }
+    return { node, offset }
+  }
+
+  // If a paragraph spans multiple columns/pages, strict "visible-only" ranges
+  // tend to start or end mid-thought. Expand a bit within the boundary block(s)
+  // so the excerpt includes the lead-in / continuation without pulling in
+  // unrelated paragraphs.
+  const semanticSelector = 'p,li,blockquote,pre,h1,h2,h3,h4,h5,h6'
+  const startBlock =
+    start.node.parentElement?.closest?.(semanticSelector) ?? null
+  const endBlock = end.node.parentElement?.closest?.(semanticSelector) ?? null
+  const contextChars = 900
+  const expandedStart =
+    startBlock && startBlock.contains(start.node)
+      ? expandCaretWithin(startBlock, start, -contextChars)
+      : start
+  const expandedEnd =
+    endBlock && endBlock.contains(end.node)
+      ? expandCaretWithin(endBlock, end, contextChars)
+      : end
+  if (compareCaret(expandedStart, expandedEnd) <= 0) {
+    start = expandedStart
+    end = expandedEnd
   }
 
   try {
+    const startRect = getRectNearTextOffset(start.node, start.offset)
+    const endRect = getRectNearTextOffset(end.node, end.offset)
+    debugReaderVisibleText('rangeEndpoints', {
+      caretPoints: caretPoints.length,
+      usedEdgeStart: Boolean(edgeStart),
+      usedEdgeEnd: Boolean(edgeEnd),
+      startBlockTag: startBlock?.tagName ?? null,
+      endBlockTag: endBlock?.tagName ?? null,
+      viewport: {
+        top: Math.round(viewportRect.top),
+        left: Math.round(viewportRect.left),
+        bottom: Math.round(viewportRect.bottom),
+        right: Math.round(viewportRect.right),
+      },
+      scrollLeft: Math.round(viewportEl.scrollLeft),
+      scrollTop: Math.round(viewportEl.scrollTop),
+      start: {
+        offset: start.offset,
+        preview: (start.node.nodeValue ?? '').slice(
+          Math.max(0, start.offset - 60),
+          start.offset + 60,
+        ),
+        rect: startRect
+          ? {
+              top: Math.round(startRect.top),
+              left: Math.round(startRect.left),
+              bottom: Math.round(startRect.bottom),
+              right: Math.round(startRect.right),
+              w: Math.round(startRect.width),
+              h: Math.round(startRect.height),
+            }
+          : null,
+      },
+      end: {
+        offset: end.offset,
+        preview: (end.node.nodeValue ?? '').slice(
+          Math.max(0, end.offset - 60),
+          end.offset + 60,
+        ),
+        rect: endRect
+          ? {
+              top: Math.round(endRect.top),
+              left: Math.round(endRect.left),
+              bottom: Math.round(endRect.bottom),
+              right: Math.round(endRect.right),
+              w: Math.round(endRect.width),
+              h: Math.round(endRect.height),
+            }
+          : null,
+      },
+    })
+
     const range = doc.createRange()
     range.setStart(start.node, start.offset)
     range.setEnd(end.node, end.offset)
     const rawText = range.toString()
+    debugReaderVisibleText('rangeTextSample', {
+      rawLen: rawText.length,
+      head: rawText.slice(0, 220),
+      tail: rawText.slice(Math.max(0, rawText.length - 220)),
+    })
     const cleaned = normalizeVisibleText(rawText)
     if (!cleaned) return null
     if (cleaned.length <= maxChars) return cleaned
@@ -431,28 +753,21 @@ function extractVisibleText(options: {
   const viewportRect = viewportEl.getBoundingClientRect()
   const root = layout.contentEl ?? doc.body ?? doc.documentElement
 
-  if (flowMode === 'paginated') {
-    const byCaret = extractVisibleTextByCaret({
-      doc,
-      layout,
-      maxChars,
-      marginX: 2,
-      marginY: 16,
-    })
-    if (byCaret) return byCaret
-  }
-
   const candidates = Array.from(
     root.querySelectorAll('h1,h2,h3,h4,h5,h6,p,li,blockquote,pre,div,span'),
   ) as HTMLElement[]
 
+  const conservativeNeighbors = flowMode === 'paginated'
+
   const pieces: string[] = []
   let used = 0
 
-  const push = (raw: string) => {
+  const push = (raw: string, opts?: { truncateTo?: number }) => {
     const cleaned = normalizeVisibleText(raw)
     if (!cleaned) return
-    const chunk = cleaned.length > 600 ? `${cleaned.slice(0, 600)}…` : cleaned
+    const truncateTo = Math.max(80, Number(opts?.truncateTo ?? 600))
+    const chunk =
+      cleaned.length > truncateTo ? `${cleaned.slice(0, truncateTo)}…` : cleaned
     if (used + chunk.length > maxChars) {
       const remain = Math.max(0, maxChars - used)
       if (remain > 24) pieces.push(`${chunk.slice(0, remain)}…`)
@@ -487,12 +802,7 @@ function extractVisibleText(options: {
   const tagRank = (el: HTMLElement) => {
     const tag = el.tagName
     if (/^H[1-6]$/.test(tag)) return 0
-    if (
-      tag === 'P' ||
-      tag === 'LI' ||
-      tag === 'BLOCKQUOTE' ||
-      tag === 'PRE'
-    ) {
+    if (tag === 'P' || tag === 'LI' || tag === 'BLOCKQUOTE' || tag === 'PRE') {
       return 0
     }
     if (tag === 'DIV') return 1
@@ -528,7 +838,8 @@ function extractVisibleText(options: {
       const absoluteLeft = rect.left - viewportRect.left + pageLeft
       const absoluteRight = absoluteLeft + rect.width
       const overlapsHorizontally =
-        absoluteRight >= pageLeft - marginX && absoluteLeft <= pageRight + marginX
+        absoluteRight >= pageLeft - marginX &&
+        absoluteLeft <= pageRight + marginX
       if (overlapsHorizontally) return rect
     }
     return null
@@ -568,10 +879,84 @@ function extractVisibleText(options: {
     return a.absoluteLeft - b.absoluteLeft
   })
 
-  for (const { el } of prunedVisibleBlocks) {
-    if (used >= maxChars) break
-    push(el.innerText || el.textContent || '')
+  if (prunedVisibleBlocks.length > 0 && conservativeNeighbors) {
+    // Include a tiny bit of context from neighboring blocks so we don't clip
+    // mid-thought at column/page boundaries.
+    const first = prunedVisibleBlocks[0]!.el
+    const last = prunedVisibleBlocks[prunedVisibleBlocks.length - 1]!.el
+    const semanticSelector = 'h1,h2,h3,h4,h5,h6,p,li,blockquote,pre'
+    const getPrev = (el: HTMLElement) => {
+      let cur: Element | null = el
+      while (cur) {
+        const prev = cur.previousElementSibling
+        if (!prev) {
+          cur = cur.parentElement
+          continue
+        }
+        if (prev.matches?.(semanticSelector)) return prev as HTMLElement
+        const candidate = prev.querySelector?.(semanticSelector)
+        if (candidate) return candidate as HTMLElement
+        cur = prev
+      }
+      return null
+    }
+    const getNext = (el: HTMLElement) => {
+      let cur: Element | null = el
+      while (cur) {
+        const next = cur.nextElementSibling
+        if (!next) {
+          cur = cur.parentElement
+          continue
+        }
+        if (next.matches?.(semanticSelector)) return next as HTMLElement
+        const candidate = next.querySelector?.(semanticSelector)
+        if (candidate) return candidate as HTMLElement
+        cur = next
+      }
+      return null
+    }
+
+    const prev = getPrev(first)
+    const next = getNext(last)
+    if (prev && used < maxChars) {
+      const t = prev.innerText || prev.textContent || ''
+      push(takeLastSentenceSnippet(t, 380), { truncateTo: 420 })
+    }
+    for (const { el } of prunedVisibleBlocks) {
+      if (used >= maxChars) break
+      // Allow a bit more per block in paginated mode to avoid losing a sentence
+      // that happens to be later in a long paragraph spanning pages.
+      push(el.innerText || el.textContent || '', {
+        truncateTo: flowMode === 'paginated' ? 1600 : 600,
+      })
+    }
+    if (next && used < maxChars) {
+      const t = next.innerText || next.textContent || ''
+      push(takeFirstSentenceSnippet(t, 380), { truncateTo: 420 })
+    }
+  } else {
+    for (const { el } of prunedVisibleBlocks) {
+      if (used >= maxChars) break
+      push(el.innerText || el.textContent || '')
+    }
   }
+
+  // For paginated mode, prefer the block-based extraction (with neighbor
+  // context). If it yields nothing, fall back to caret sampling.
+  if (flowMode === 'paginated') {
+    const byBlocks = pieces.join('\n').slice(0, maxChars).trim()
+    if (byBlocks) return byBlocks
+    const byCaret = extractVisibleTextByCaret({
+      doc,
+      layout,
+      maxChars,
+      marginX: 2,
+      marginY: 16,
+    })
+    if (byCaret) return byCaret
+    return byBlocks
+  }
+
   return pieces.join('\n').slice(0, maxChars).trim()
 }
 
@@ -584,32 +969,26 @@ async function extractVisibleParts(options: {
   maxImages: number
   maxImageBytes: number
 }): Promise<Array<TextPart | ImagePart>> {
-  const {
-    doc,
-    layout,
-    flowMode,
-    store,
-    maxChars,
-    maxImages,
-    maxImageBytes,
-  } = options
+  const { doc, layout, flowMode, store, maxChars, maxImages, maxImageBytes } =
+    options
   const viewportEl = layout.viewportEl
   const viewportRect = viewportEl.getBoundingClientRect()
   const root = layout.contentEl ?? doc.body ?? doc.documentElement
 
   if (flowMode === 'paginated') {
     const parts: Array<TextPart | ImagePart> = []
-    const text = extractVisibleTextByCaret({
+    const text = extractVisibleText({
       doc,
       layout,
+      flowMode,
       maxChars,
-      marginX: 2,
-      marginY: 16,
     })
     if (text) parts.push({ type: 'text', text })
 
     if (maxImages > 0) {
-      const imgs = Array.from(root.querySelectorAll('img')) as HTMLImageElement[]
+      const imgs = Array.from(
+        root.querySelectorAll('img'),
+      ) as HTMLImageElement[]
       const marginY = 16
       const marginX = 2
       for (const img of imgs) {
@@ -629,7 +1008,9 @@ async function extractVisibleParts(options: {
         const alt = String(
           img.getAttribute('alt') ?? img.getAttribute('title') ?? '',
         ).trim()
-        const src = String(img.currentSrc || img.getAttribute('src') || '').trim()
+        const src = String(
+          img.currentSrc || img.getAttribute('src') || '',
+        ).trim()
         const epubPathHint = String(
           img.getAttribute('data-mfv2-epub-src') ?? '',
         ).trim()
@@ -702,12 +1083,7 @@ async function extractVisibleParts(options: {
     const tag = el.tagName
     if (tag === 'IMG') return 0
     if (/^H[1-6]$/.test(tag)) return 0
-    if (
-      tag === 'P' ||
-      tag === 'LI' ||
-      tag === 'BLOCKQUOTE' ||
-      tag === 'PRE'
-    ) {
+    if (tag === 'P' || tag === 'LI' || tag === 'BLOCKQUOTE' || tag === 'PRE') {
       return 0
     }
     if (tag === 'DIV') return 1
@@ -743,7 +1119,8 @@ async function extractVisibleParts(options: {
       const absoluteLeft = rect.left - viewportRect.left + pageLeft
       const absoluteRight = absoluteLeft + rect.width
       const overlapsHorizontally =
-        absoluteRight >= pageLeft - marginX && absoluteLeft <= pageRight + marginX
+        absoluteRight >= pageLeft - marginX &&
+        absoluteLeft <= pageRight + marginX
       if (overlapsHorizontally) return rect
     }
     return null
@@ -794,7 +1171,9 @@ async function extractVisibleParts(options: {
         el.getAttribute('alt') ?? el.getAttribute('title') ?? '',
       ).trim()
       const src = String(el.currentSrc || el.getAttribute('src') || '').trim()
-      const epubPathHint = String(el.getAttribute('data-mfv2-epub-src') ?? '').trim()
+      const epubPathHint = String(
+        el.getAttribute('data-mfv2-epub-src') ?? '',
+      ).trim()
 
       flushText()
       if (alt) parts.push({ type: 'text', text: `[Image: ${alt}]` })
@@ -901,9 +1280,7 @@ async function extractSpineItemParts(options: {
       return { type: 'image', image: base64, mediaType }
     }
 
-    if (
-      hasUrlScheme(src)
-    ) {
+    if (hasUrlScheme(src)) {
       return null
     }
 
@@ -912,7 +1289,8 @@ async function extractSpineItemParts(options: {
     const resolved = resolveRelativePath(xhtmlPath, path)
     const bytes = await store.readBytes(resolved)
     if (bytes.byteLength > maxImageBytes) return null
-    if (includedBytes + bytes.byteLength > maxImageBytes * maxImages) return null
+    if (includedBytes + bytes.byteLength > maxImageBytes * maxImages)
+      return null
     includedBytes += bytes.byteLength
     return {
       type: 'image',
@@ -930,9 +1308,7 @@ async function extractSpineItemParts(options: {
 
     const rawSrc = String(imgEl.getAttribute('src') ?? '').trim()
     const alt = String(
-      imgEl.getAttribute('alt') ??
-        imgEl.getAttribute('title') ??
-        '',
+      imgEl.getAttribute('alt') ?? imgEl.getAttribute('title') ?? '',
     ).trim()
     const token = `[[[MFV2_IMG_${i}]]]`
 
@@ -961,7 +1337,8 @@ async function extractSpineItemParts(options: {
     if (usedText >= maxChars) return
     if (usedText + cleaned.length > maxChars) {
       const remain = Math.max(0, maxChars - usedText)
-      if (remain > 24) parts.push({ type: 'text', text: `${cleaned.slice(0, remain)}…` })
+      if (remain > 24)
+        parts.push({ type: 'text', text: `${cleaned.slice(0, remain)}…` })
       usedText = maxChars
       return
     }
@@ -971,7 +1348,11 @@ async function extractSpineItemParts(options: {
 
   const tokenRegex = /\[\[\[MFV2_IMG_\d+\]\]\]/g
   let lastIndex = 0
-  for (let match = tokenRegex.exec(rawText); match; match = tokenRegex.exec(rawText)) {
+  for (
+    let match = tokenRegex.exec(rawText);
+    match;
+    match = tokenRegex.exec(rawText)
+  ) {
     if (usedText >= maxChars) break
     const token = match[0] ?? ''
     buffer += rawText.slice(lastIndex, match.index)
@@ -1045,32 +1426,47 @@ function loadPendingTranslateVariants(bookId: string): TranslateVariant[] {
     if (!Array.isArray(parsed)) return []
     return parsed
       .map((v) => String(v ?? '').trim())
-      .filter((v): v is TranslateVariant => v.startsWith('translate_') && isReaderVariant(v))
+      .filter(
+        (v): v is TranslateVariant =>
+          v.startsWith('translate_') && isReaderVariant(v),
+      )
   } catch {
     return []
   }
 }
 
-function storePendingTranslateVariants(bookId: string, variants: TranslateVariant[]) {
+function storePendingTranslateVariants(
+  bookId: string,
+  variants: TranslateVariant[],
+) {
   try {
     if (typeof window === 'undefined' || typeof localStorage === 'undefined')
       return
     const unique = Array.from(new Set(variants)).filter(
       (v) => v.startsWith('translate_') && isReaderVariant(v),
     )
-    localStorage.setItem(pendingTranslateStorageKey(bookId), JSON.stringify(unique))
+    localStorage.setItem(
+      pendingTranslateStorageKey(bookId),
+      JSON.stringify(unique),
+    )
   } catch {
     // ignore
   }
 }
 
-function rememberPendingTranslateVariant(bookId: string, variant: TranslateVariant) {
+function rememberPendingTranslateVariant(
+  bookId: string,
+  variant: TranslateVariant,
+) {
   const existing = loadPendingTranslateVariants(bookId)
   if (existing.includes(variant)) return
   storePendingTranslateVariants(bookId, [...existing, variant])
 }
 
-function forgetPendingTranslateVariant(bookId: string, variant: TranslateVariant) {
+function forgetPendingTranslateVariant(
+  bookId: string,
+  variant: TranslateVariant,
+) {
   const existing = loadPendingTranslateVariants(bookId)
   if (!existing.includes(variant)) return
   storePendingTranslateVariants(
@@ -1323,6 +1719,7 @@ const EpubReaderV2Inner = forwardRef<
 
   const containerRef = useRef<HTMLDivElement>(null)
   const iframeRef = useRef<HTMLIFrameElement>(null)
+  const pageIndicatorRef = useRef<HTMLDivElement>(null)
   const { width: containerWidth, height: containerHeight } =
     useElementSize(containerRef)
 
@@ -1429,7 +1826,7 @@ const EpubReaderV2Inner = forwardRef<
     if (!bookId) return
 
     let cancelled = false
-    ;(async () => {
+    void (async () => {
       try {
         const status = await getBookTransform(bookId, { type: 'modernify' })
         if (cancelled) return
@@ -1709,51 +2106,54 @@ const EpubReaderV2Inner = forwardRef<
     return { spineIndex: currentSpineIndex, chapterProgress }
   }, [spineIndex])
 
-  const startModernify = useCallback(async (options?: { force?: boolean }) => {
-    const bookId = baseStorageId
-    if (!bookId) return
-    const key: ReaderVariant = 'modernify'
-    if (transformStartInFlightRef.current[key]) return
-    transformStartInFlightRef.current[key] = true
-    // Optimistically mark as running so the UI reacts immediately.
-    const optimisticNow = new Date().toISOString()
-    setTransformStatuses((prev) => ({
-      ...prev,
-      [key]: {
-        status: 'pending',
-        dest_key: prev[key]?.dest_key ?? '',
-        created_at: prev[key]?.created_at ?? optimisticNow,
-        updated_at: optimisticNow,
-      },
-    }))
-    try {
-      const force = Boolean(options?.force)
-      const status = await startBookTransform(bookId, {
-        type: 'modernify',
-        ...(force ? { force: true } : {}),
-      })
+  const startModernify = useCallback(
+    async (options?: { force?: boolean }) => {
+      const bookId = baseStorageId
+      if (!bookId) return
+      const key: ReaderVariant = 'modernify'
+      if (transformStartInFlightRef.current[key]) return
+      transformStartInFlightRef.current[key] = true
+      // Optimistically mark as running so the UI reacts immediately.
+      const optimisticNow = new Date().toISOString()
       setTransformStatuses((prev) => ({
         ...prev,
-        [key]: mergeTransformStatus(prev[key], status),
+        [key]: {
+          status: 'pending',
+          dest_key: prev[key]?.dest_key ?? '',
+          created_at: prev[key]?.created_at ?? optimisticNow,
+          updated_at: optimisticNow,
+        },
       }))
-      if (status.status === 'error') {
-        showToast(
-          `Modernize failed: ${status.error ?? 'Unknown error'}`,
-          'error',
-        )
+      try {
+        const force = Boolean(options?.force)
+        const status = await startBookTransform(bookId, {
+          type: 'modernify',
+          ...(force ? { force: true } : {}),
+        })
+        setTransformStatuses((prev) => ({
+          ...prev,
+          [key]: mergeTransformStatus(prev[key], status),
+        }))
+        if (status.status === 'error') {
+          showToast(
+            `Modernize failed: ${status.error ?? 'Unknown error'}`,
+            'error',
+          )
+        }
+      } catch (err) {
+        const message =
+          err instanceof Error ? err.message : 'Failed to start transform'
+        showToast(`Modernize failed: ${message}`, 'error')
+        setTransformStatuses((prev) => ({
+          ...prev,
+          [key]: { status: 'error', dest_key: '', error: message },
+        }))
+      } finally {
+        transformStartInFlightRef.current[key] = false
       }
-    } catch (err) {
-      const message =
-        err instanceof Error ? err.message : 'Failed to start transform'
-      showToast(`Modernize failed: ${message}`, 'error')
-      setTransformStatuses((prev) => ({
-        ...prev,
-        [key]: { status: 'error', dest_key: '', error: message },
-      }))
-    } finally {
-      transformStartInFlightRef.current[key] = false
-    }
-  }, [baseStorageId, showToast])
+    },
+    [baseStorageId, showToast],
+  )
 
   const startTranslate = useCallback(
     async (langInput: string) => {
@@ -2207,7 +2607,13 @@ const EpubReaderV2Inner = forwardRef<
       setTocOpen(false)
       setSettingsOpen(false)
     },
-    [publication, spineIndex, spineIndexByPath, goToAnchorInCurrentDoc, loadSpine],
+    [
+      publication,
+      spineIndex,
+      spineIndexByPath,
+      goToAnchorInCurrentDoc,
+      loadSpine,
+    ],
   )
 
   const goToPage = useCallback(
@@ -2254,11 +2660,7 @@ const EpubReaderV2Inner = forwardRef<
   )
 
   const goToTextOffsetInCurrentDoc = useCallback(
-    (
-      textOffset: number,
-      behavior?: ScrollBehavior,
-      expectedText?: string,
-    ) => {
+    (textOffset: number, behavior?: ScrollBehavior, expectedText?: string) => {
       const doc = iframeDocRef.current
       const layout = appliedLayoutRef.current
       if (!doc || !layout) return false
@@ -2306,8 +2708,7 @@ const EpubReaderV2Inner = forwardRef<
         const maxStep = 48
 
         for (let step = 0; step <= maxStep; step++) {
-          const candidates =
-            step === 0 ? [pivot] : [pivot + step, pivot - step]
+          const candidates = step === 0 ? [pivot] : [pivot + step, pivot - step]
           for (const idx of candidates) {
             if (idx < 0 || idx >= len) continue
             if (step < maxStep && isWhitespaceChar(value[idx] ?? '')) continue
@@ -2327,8 +2728,7 @@ const EpubReaderV2Inner = forwardRef<
 
       if (settings.flowMode === 'scrolled') {
         const viewportRect = layout.viewportEl.getBoundingClientRect()
-        const rect =
-          rangeRect ?? (el as HTMLElement).getBoundingClientRect()
+        const rect = rangeRect ?? (el as HTMLElement).getBoundingClientRect()
         const targetTop =
           rect.top - viewportRect.top + layout.viewportEl.scrollTop
         layout.viewportEl.scrollTo({
@@ -2449,7 +2849,7 @@ const EpubReaderV2Inner = forwardRef<
         const el =
           node && node.nodeType === Node.ELEMENT_NODE
             ? (node as Element)
-            : node?.parentElement ?? null
+            : (node?.parentElement ?? null)
         if (!el) return true
 
         const rangeRect = (() => {
@@ -2468,8 +2868,7 @@ const EpubReaderV2Inner = forwardRef<
 
         if (settings.flowMode === 'scrolled') {
           const viewportRect = layout.viewportEl.getBoundingClientRect()
-          const rect =
-            rangeRect ?? (el as HTMLElement).getBoundingClientRect()
+          const rect = rangeRect ?? (el as HTMLElement).getBoundingClientRect()
           const targetTop =
             rect.top - viewportRect.top + layout.viewportEl.scrollTop
           layout.viewportEl.scrollTo({
@@ -2608,25 +3007,37 @@ const EpubReaderV2Inner = forwardRef<
   prevRef.current = prev
   showHudRef.current = showHud
 
-  const waitForSettledLayout = useCallback(async (options?: { timeoutMs?: number }) => {
-    if (typeof window === 'undefined') return
-    const timeoutMs = Math.max(0, Number(options?.timeoutMs ?? 1200))
-    const start = typeof performance !== 'undefined' ? performance.now() : Date.now()
-    const nextFrame = () => new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()))
+  const waitForSettledLayout = useCallback(
+    async (options?: { timeoutMs?: number }) => {
+      if (typeof window === 'undefined') return
+      const timeoutMs = Math.max(0, Number(options?.timeoutMs ?? 1200))
+      const start =
+        typeof performance !== 'undefined' ? performance.now() : Date.now()
+      const nextFrame = () =>
+        new Promise<void>((resolve) =>
+          window.requestAnimationFrame(() => resolve()),
+        )
 
-    // Give React/layout a frame to apply pending size changes before sampling.
-    await nextFrame()
-
-    // Wait for any reflow/restore (e.g. panel resize) to finish.
-    while (suppressPersistRef.current || !appliedLayoutRef.current || !iframeDocRef.current) {
-      const now = typeof performance !== 'undefined' ? performance.now() : Date.now()
-      if (timeoutMs && now - start > timeoutMs) break
+      // Give React/layout a frame to apply pending size changes before sampling.
       await nextFrame()
-    }
 
-    // Give the browser a frame to paint after scroll/layout settle.
-    await nextFrame()
-  }, [])
+      // Wait for any reflow/restore (e.g. panel resize) to finish.
+      while (
+        suppressPersistRef.current ||
+        !appliedLayoutRef.current ||
+        !iframeDocRef.current
+      ) {
+        const now =
+          typeof performance !== 'undefined' ? performance.now() : Date.now()
+        if (timeoutMs && now - start > timeoutMs) break
+        await nextFrame()
+      }
+
+      // Give the browser a frame to paint after scroll/layout settle.
+      await nextFrame()
+    },
+    [],
+  )
 
   const computeVisiblePage = useCallback((): EpubReaderV2VisiblePage | null => {
     const pub = publicationRef.current
@@ -2651,11 +3062,7 @@ const EpubReaderV2Inner = forwardRef<
         : 0
     const pageIndex =
       flowMode === 'paginated'
-        ? clamp(
-            Math.round(rawPageIndex),
-            0,
-            Math.max(0, layout.totalPages - 1),
-          )
+        ? clamp(Math.round(rawPageIndex), 0, Math.max(0, layout.totalPages - 1))
         : 0
 
     const text = extractVisibleText({
@@ -2704,10 +3111,7 @@ const EpubReaderV2Inner = forwardRef<
         store,
         maxChars: Math.max(1, Number(options?.maxChars ?? 8000)),
         maxImages: Math.max(0, Number(options?.maxImages ?? 3)),
-        maxImageBytes: Math.max(
-          1,
-          Number(options?.maxImageBytes ?? 1_500_000),
-        ),
+        maxImageBytes: Math.max(1, Number(options?.maxImageBytes ?? 1_500_000)),
       })
     },
     [],
@@ -2775,7 +3179,10 @@ const EpubReaderV2Inner = forwardRef<
             store,
             maxChars: Math.max(1, Number(options?.maxChars ?? 18_000)),
             maxImages: Math.max(0, Number(options?.maxImages ?? 6)),
-            maxImageBytes: Math.max(1, Number(options?.maxImageBytes ?? 1_500_000)),
+            maxImageBytes: Math.max(
+              1,
+              Number(options?.maxImageBytes ?? 1_500_000),
+            ),
           })
         } catch {
           return null
@@ -2850,11 +3257,26 @@ const EpubReaderV2Inner = forwardRef<
       const suppressToken = ++suppressPersistTokenRef.current
       suppressPersistRef.current = true
 
+      let safeBottomPx = 0
+      try {
+        const indicatorRect =
+          pageIndicatorRef.current?.getBoundingClientRect?.() ?? null
+        const overlayHeight = Math.max(0, indicatorRect?.height ?? 0)
+        const extraMargin = 28 // accounts for bottom offset + breathing room
+        safeBottomPx =
+          settings.flowMode === 'paginated'
+            ? Math.ceil(overlayHeight + extraMargin)
+            : 0
+      } catch {
+        // ignore
+      }
+
       const layout = applyReaderLayout({
         doc,
         viewportWidth: pageViewport.width,
         viewportHeight: pageViewport.height,
         settings,
+        safeArea: { bottomPx: safeBottomPx },
       })
       appliedLayoutRef.current = layout
 
@@ -2971,7 +3393,10 @@ const EpubReaderV2Inner = forwardRef<
             expectedText,
           ) ||
           (expectedText
-            ? goToTextSearchInCurrentDoc(expectedText, effectivePending.behavior)
+            ? goToTextSearchInCurrentDoc(
+                expectedText,
+                effectivePending.behavior,
+              )
             : false)
         if (ok) {
           if (effectivePending.consumeNavigationId) {
@@ -3536,10 +3961,7 @@ const EpubReaderV2Inner = forwardRef<
           event.preventDefault()
           return
         }
-        if (
-          hasUrlScheme(rawHref) &&
-          !isEpubCfiHref(rawHref)
-        ) {
+        if (hasUrlScheme(rawHref) && !isEpubCfiHref(rawHref)) {
           event.preventDefault()
           return
         }
@@ -3961,9 +4383,7 @@ const EpubReaderV2Inner = forwardRef<
 
     const ok =
       goToTextOffsetInCurrentDoc(textOffset, 'auto', selectedText) ||
-      (selectedText
-        ? goToTextSearchInCurrentDoc(selectedText, 'auto')
-        : false)
+      (selectedText ? goToTextSearchInCurrentDoc(selectedText, 'auto') : false)
     debugReaderNav('pendingNavigation:applyInDoc', {
       id: pendingNavigation.id,
       spineIndex,
@@ -5298,7 +5718,9 @@ const EpubReaderV2Inner = forwardRef<
                     <button
                       className="mfv2-reader__versionMetaButton"
                       type="button"
-                      disabled={!translateLangDraft.trim() || translateDraftBusy}
+                      disabled={
+                        !translateLangDraft.trim() || translateDraftBusy
+                      }
                       onClick={() => {
                         void startTranslate(translateLangDraft)
                       }}
@@ -5751,7 +6173,11 @@ const EpubReaderV2Inner = forwardRef<
         }}
       />
 
-      <div className="mfv2-reader__pageIndicator" aria-hidden={false}>
+      <div
+        ref={pageIndicatorRef}
+        className="mfv2-reader__pageIndicator"
+        aria-hidden={false}
+      >
         <strong>{globalPageInfo.current}</strong>
         <span
           className={`mfv2-reader__pageIndicatorDetails ${hudVisible ? 'is-visible' : ''}`}
