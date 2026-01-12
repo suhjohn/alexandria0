@@ -512,6 +512,17 @@ func (r *BookRepository) GetByID(ctx context.Context, id uuid.UUID) (*Book, erro
 	return &book, nil
 }
 
+func (r *BookRepository) DeleteOwned(ctx context.Context, id uuid.UUID, ownerUserID uuid.UUID) (bool, error) {
+	tag, err := r.pool.Exec(ctx, `
+		DELETE FROM books
+		WHERE id = $1 AND owner_user_id = $2
+	`, id, ownerUserID)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
 func (r *BookRepository) Create(ctx context.Context, book *Book) error {
 	if book.ID == uuid.Nil {
 		book.ID = uuid.New()

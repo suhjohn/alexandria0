@@ -1,8 +1,12 @@
 package handlers
 
 import (
+	"archive/zip"
+	"bytes"
+	"encoding/xml"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -27,6 +31,118 @@ var errPersonalQuotaExceeded = errors.New("personal upload quota exceeded")
 
 func NewBooksHandler(repo *models.BookRepository, auth CurrentUserProvider, r2 *storage.R2Client) *BooksHandler {
 	return &BooksHandler{repo: repo, auth: auth, r2: r2}
+}
+
+func (h *BooksHandler) GetThumbnail(w http.ResponseWriter, r *http.Request) {
+	if h.r2 == nil {
+		respondError(w, r, "File storage unavailable", http.StatusBadGateway, nil)
+		return
+	}
+
+	bookID, err := parseBookID(r)
+	if err != nil {
+		respondError(w, r, "Invalid book id", http.StatusBadRequest, err)
+		return
+	}
+
+	var userID *uuid.UUID
+	email := ""
+	if h.auth != nil {
+		user, err := h.auth.CurrentUser(r)
+		if err != nil {
+			respondError(w, r, "Failed to resolve user", http.StatusInternalServerError, err)
+			return
+		}
+		if user != nil {
+			userID = &user.ID
+			email = user.Email
+		}
+	}
+
+	ok, err := h.repo.HasAccess(r.Context(), bookID, userID, email)
+	if err != nil {
+		respondError(w, r, "Failed to check book access", http.StatusInternalServerError, err)
+		return
+	}
+	if !ok {
+		respondError(w, r, "Book not found", http.StatusNotFound, nil)
+		return
+	}
+
+	coverKey := storage.BookCoverKey(bookID)
+	rc, meta, err := h.r2.Download(r.Context(), coverKey)
+	if err != nil {
+		if errors.Is(err, storage.ErrObjectNotFound) {
+			// Lazy-generate the cover from the source EPUB if possible (useful for
+			// older uploads created before thumbnail extraction existed).
+			book, bookErr := h.repo.GetByID(r.Context(), bookID)
+			if bookErr != nil || book == nil {
+				respondError(w, r, "Thumbnail not found", http.StatusNotFound, err)
+				return
+			}
+
+			sourceKey, resolveErr := resolveR2Key(book.URL, h.r2)
+			if resolveErr != nil {
+				respondError(w, r, "Thumbnail not found", http.StatusNotFound, err)
+				return
+			}
+
+			epubRC, epubMeta, epubErr := h.r2.Download(r.Context(), sourceKey)
+			if epubErr != nil {
+				respondError(w, r, "Thumbnail not found", http.StatusNotFound, epubErr)
+				return
+			}
+			defer epubRC.Close()
+
+			const maxEPUBBytesForCover = int64(55 << 20) // 55MB
+			if epubMeta.ContentLength > maxEPUBBytesForCover {
+				respondError(w, r, "Thumbnail not found", http.StatusNotFound, nil)
+				return
+			}
+
+			epubBytes, readErr := io.ReadAll(io.LimitReader(epubRC, maxEPUBBytesForCover+1))
+			if readErr != nil || int64(len(epubBytes)) > maxEPUBBytesForCover {
+				respondError(w, r, "Thumbnail not found", http.StatusNotFound, readErr)
+				return
+			}
+
+			coverBytes, coverContentType := extractCoverImageFromEPUB(bytes.NewReader(epubBytes), int64(len(epubBytes)))
+			if len(coverBytes) == 0 {
+				respondError(w, r, "Thumbnail not found", http.StatusNotFound, nil)
+				return
+			}
+
+			if _, uploadErr := h.r2.Upload(r.Context(), coverBytes, coverKey, coverContentType); uploadErr != nil {
+				respondError(w, r, "Thumbnail not found", http.StatusNotFound, uploadErr)
+				return
+			}
+
+			w.Header().Set("Cache-Control", "private, max-age=0, no-store")
+			if coverContentType != "" {
+				w.Header().Set("Content-Type", coverContentType)
+			}
+			w.Header().Set("Content-Length", strconv.Itoa(len(coverBytes)))
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(coverBytes)
+			return
+		}
+		respondError(w, r, "Failed to fetch thumbnail", http.StatusBadGateway, err)
+		return
+	}
+	defer rc.Close()
+
+	w.Header().Set("Cache-Control", "private, max-age=0, no-store")
+	if meta.ContentType != "" {
+		w.Header().Set("Content-Type", meta.ContentType)
+	} else {
+		w.Header().Set("Content-Type", "application/octet-stream")
+	}
+	if meta.ContentLength > 0 {
+		w.Header().Set("Content-Length", strconv.FormatInt(meta.ContentLength, 10))
+	}
+
+	w.WriteHeader(http.StatusOK)
+	_, _ = io.Copy(w, rc)
 }
 
 func (h *BooksHandler) GetAll(w http.ResponseWriter, r *http.Request) {
@@ -160,6 +276,65 @@ func (h *BooksHandler) GetByID(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(book)
+}
+
+func (h *BooksHandler) Delete(w http.ResponseWriter, r *http.Request) {
+	if h.auth == nil {
+		respondError(w, r, "Unauthorized", http.StatusUnauthorized, nil)
+		return
+	}
+	if h.r2 == nil {
+		respondError(w, r, "File storage unavailable", http.StatusBadGateway, nil)
+		return
+	}
+
+	user, err := h.auth.CurrentUser(r)
+	if err != nil {
+		respondError(w, r, "Failed to resolve user", http.StatusInternalServerError, err)
+		return
+	}
+	if user == nil {
+		respondError(w, r, "Unauthorized", http.StatusUnauthorized, nil)
+		return
+	}
+
+	bookID, err := parseBookID(r)
+	if err != nil {
+		respondError(w, r, "Invalid book id", http.StatusBadRequest, err)
+		return
+	}
+
+	book, err := h.repo.GetByID(r.Context(), bookID)
+	if err != nil {
+		respondError(w, r, "Failed to fetch book", http.StatusInternalServerError, err)
+		return
+	}
+	if book == nil {
+		respondError(w, r, "Book not found", http.StatusNotFound, nil)
+		return
+	}
+	if book.OwnerUserID == nil || *book.OwnerUserID != user.ID {
+		respondError(w, r, "Forbidden", http.StatusForbidden, nil)
+		return
+	}
+
+	prefix := fmt.Sprintf("books/%s/", bookID.String())
+	if _, err := h.r2.DeletePrefix(r.Context(), prefix); err != nil {
+		respondError(w, r, "Failed to delete book files", http.StatusBadGateway, err)
+		return
+	}
+
+	deleted, err := h.repo.DeleteOwned(r.Context(), bookID, user.ID)
+	if err != nil {
+		respondError(w, r, "Failed to delete book", http.StatusInternalServerError, err)
+		return
+	}
+	if !deleted {
+		respondError(w, r, "Book not found", http.StatusNotFound, nil)
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (h *BooksHandler) GetFile(w http.ResponseWriter, r *http.Request) {
@@ -340,6 +515,14 @@ func (h *BooksHandler) Upload(w http.ResponseWriter, r *http.Request) {
 		sourceSizeBytes = reader.bytesRead
 	}
 
+	var coverBytes []byte
+	var coverContentType string
+	contentLengthForCover := contentLength
+	if contentLengthForCover <= 0 {
+		contentLengthForCover = sourceSizeBytes
+	}
+	coverBytes, coverContentType = extractCoverImageFromEPUBFile(file, contentLengthForCover)
+
 	title := strings.TrimSpace(r.FormValue("title"))
 	if title == "" {
 		title = strings.TrimSpace(strings.TrimSuffix(header.Filename, path.Ext(header.Filename)))
@@ -360,6 +543,13 @@ func (h *BooksHandler) Upload(w http.ResponseWriter, r *http.Request) {
 		OwnerUserID:        &user.ID,
 	}
 
+	if len(coverBytes) > 0 {
+		coverKey := storage.BookCoverKey(bookID)
+		if _, err := h.r2.Upload(r.Context(), coverBytes, coverKey, coverContentType); err == nil {
+			book.ThumbnailURL = h.r2.PublicURL(coverKey)
+		}
+	}
+
 	if err := h.repo.Create(r.Context(), book); err != nil {
 		_ = h.r2.Delete(r.Context(), destKey)
 		respondError(w, r, "Failed to create book", http.StatusInternalServerError, err)
@@ -368,6 +558,229 @@ func (h *BooksHandler) Upload(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(book)
+}
+
+type epubContainer struct {
+	Rootfiles struct {
+		Rootfile []struct {
+			FullPath string `xml:"full-path,attr"`
+		} `xml:"rootfile"`
+	} `xml:"rootfiles"`
+}
+
+type opfCoverCandidate struct {
+	Properties string
+	ID         string
+	Href       string
+	MediaType  string
+}
+
+func extractCoverImageFromEPUBFile(file multipart.File, size int64) ([]byte, string) {
+	if file == nil || size <= 0 {
+		return nil, ""
+	}
+
+	readerAt, ok := file.(io.ReaderAt)
+	if !ok {
+		return nil, ""
+	}
+
+	return extractCoverImageFromEPUB(readerAt, size)
+}
+
+func extractCoverImageFromEPUB(readerAt io.ReaderAt, size int64) ([]byte, string) {
+	if readerAt == nil || size <= 0 {
+		return nil, ""
+	}
+
+	zr, err := zip.NewReader(readerAt, size)
+	if err != nil {
+		return nil, ""
+	}
+
+	readFile := func(name string) ([]byte, bool) {
+		for _, zf := range zr.File {
+			if zf.Name != name {
+				continue
+			}
+			if zf.UncompressedSize64 > 15<<20 {
+				return nil, false
+			}
+			rc, err := zf.Open()
+			if err != nil {
+				return nil, false
+			}
+			defer rc.Close()
+			data, err := io.ReadAll(rc)
+			if err != nil {
+				return nil, false
+			}
+			return data, true
+		}
+
+		// Case-insensitive fallback.
+		lower := strings.ToLower(name)
+		for _, zf := range zr.File {
+			if strings.ToLower(zf.Name) != lower {
+				continue
+			}
+			if zf.UncompressedSize64 > 15<<20 {
+				return nil, false
+			}
+			rc, err := zf.Open()
+			if err != nil {
+				return nil, false
+			}
+			defer rc.Close()
+			data, err := io.ReadAll(rc)
+			if err != nil {
+				return nil, false
+			}
+			return data, true
+		}
+
+		return nil, false
+	}
+
+	// 1) Attempt EPUB-standard cover resolution via container.xml + OPF metadata.
+	if containerBytes, ok := readFile("META-INF/container.xml"); ok {
+		var container epubContainer
+		if err := xml.Unmarshal(containerBytes, &container); err == nil {
+			opfPath := ""
+			if len(container.Rootfiles.Rootfile) > 0 {
+				opfPath = strings.TrimSpace(container.Rootfiles.Rootfile[0].FullPath)
+			}
+			if opfPath != "" {
+				if opfBytes, ok := readFile(opfPath); ok {
+					coverPath := resolveCoverPathFromOPF(opfPath, opfBytes)
+					if coverPath != "" {
+						if coverBytes, ok := readFile(coverPath); ok {
+							contentType := http.DetectContentType(coverBytes)
+							if strings.HasPrefix(contentType, "image/") {
+								return coverBytes, contentType
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// 2) Fallback heuristic: "cover"/"title" + image extensions.
+	for _, zf := range zr.File {
+		lower := strings.ToLower(zf.Name)
+		if !(strings.Contains(lower, "cover") || strings.Contains(lower, "title")) {
+			continue
+		}
+		if !(strings.HasSuffix(lower, ".jpg") || strings.HasSuffix(lower, ".jpeg") || strings.HasSuffix(lower, ".png")) {
+			continue
+		}
+		if zf.UncompressedSize64 > 15<<20 {
+			continue
+		}
+		rc, err := zf.Open()
+		if err != nil {
+			continue
+		}
+		data, err := io.ReadAll(rc)
+		rc.Close()
+		if err != nil {
+			continue
+		}
+		contentType := http.DetectContentType(data)
+		if strings.HasPrefix(contentType, "image/") {
+			return data, contentType
+		}
+	}
+
+	return nil, ""
+}
+
+func resolveCoverPathFromOPF(opfPath string, opfBytes []byte) string {
+	if len(opfBytes) == 0 {
+		return ""
+	}
+
+	decoder := xml.NewDecoder(bytes.NewReader(opfBytes))
+
+	coverID := ""
+	candidates := make([]opfCoverCandidate, 0, 8)
+
+	for {
+		tok, err := decoder.Token()
+		if err != nil {
+			break
+		}
+		start, ok := tok.(xml.StartElement)
+		if !ok {
+			continue
+		}
+
+		switch start.Name.Local {
+		case "meta":
+			name := ""
+			content := ""
+			for _, attr := range start.Attr {
+				if attr.Name.Local == "name" {
+					name = strings.TrimSpace(attr.Value)
+				} else if attr.Name.Local == "content" {
+					content = strings.TrimSpace(attr.Value)
+				}
+			}
+			if name == "cover" && content != "" {
+				coverID = content
+			}
+		case "item":
+			item := opfCoverCandidate{}
+			for _, attr := range start.Attr {
+				switch attr.Name.Local {
+				case "properties":
+					item.Properties = strings.TrimSpace(attr.Value)
+				case "id":
+					item.ID = strings.TrimSpace(attr.Value)
+				case "href":
+					item.Href = strings.TrimSpace(attr.Value)
+				case "media-type":
+					item.MediaType = strings.TrimSpace(attr.Value)
+				}
+			}
+			if item.Href != "" {
+				candidates = append(candidates, item)
+			}
+		}
+	}
+
+	chosenHref := ""
+	for _, item := range candidates {
+		if strings.Contains(item.Properties, "cover-image") {
+			chosenHref = item.Href
+			break
+		}
+	}
+	if chosenHref == "" && coverID != "" {
+		for _, item := range candidates {
+			if item.ID == coverID {
+				chosenHref = item.Href
+				break
+			}
+		}
+	}
+	if chosenHref == "" {
+		for _, item := range candidates {
+			if strings.Contains(strings.ToLower(item.ID), "cover") && strings.HasPrefix(item.MediaType, "image/") {
+				chosenHref = item.Href
+				break
+			}
+		}
+	}
+	if chosenHref == "" {
+		return ""
+	}
+
+	opfDir := path.Dir(opfPath)
+	resolved := path.Clean(path.Join(opfDir, chosenHref))
+	resolved = strings.TrimPrefix(resolved, "/")
+	return resolved
 }
 
 func parseInt(raw string, fallback int) int {

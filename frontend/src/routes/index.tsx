@@ -19,6 +19,7 @@ import {
   PanelRightOpen,
   Search,
   Settings,
+  Trash2,
   Upload,
   X,
 } from 'lucide-react'
@@ -26,7 +27,15 @@ import { IoLibraryOutline, IoLogoGoogle } from 'react-icons/io5'
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useVirtualizer } from '@tanstack/react-virtual'
-import { getBook, getBookFileUrl, searchBooks, uploadBook, type Book } from '@/data/books'
+import {
+  getBook,
+  getBookFileUrl,
+  getBookThumbnailUrl,
+  searchBooks,
+  deleteBook,
+  uploadBook,
+  type Book,
+} from '@/data/books'
 import type {
   EpubReaderV2Handle,
   EpubReaderV2Status,
@@ -56,6 +65,16 @@ import {
   TooltipTrigger,
 } from '@/components/ui/tooltip'
 import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog'
+import {
   DEFAULT_READER_SETTINGS,
   setReaderSettings,
   updateReaderSettings,
@@ -79,22 +98,130 @@ const LIBRARY_PANEL_WIDTH_COOKIE = 'library-panel-width'
 const LIBRARY_PANEL_VISIBLE_COOKIE = 'library-panel-visible'
 const CHAT_PANEL_WIDTH_COOKIE = 'chat-panel-width'
 const CHAT_PANEL_VISIBLE_COOKIE = 'chat-panel-visible'
+const LIBRARY_SCOPE_COOKIE = 'library-scope'
+const LEFT_PANEL_VIEW_COOKIE = 'left-panel-view'
 const SELECTED_BOOK_COOKIE = 'selected-book-id'
 const DEFAULT_PANEL_WIDTH = 240
 const DEFAULT_CHAT_PANEL_WIDTH = 360
 const SELECTED_BOOK_MAX_AGE = 60 * 60 * 24 * 30
 const PANEL_VISIBLE_MAX_AGE = 60 * 60 * 24 * 365 // 1 year
+const PANEL_PREFERENCE_MAX_AGE = 60 * 60 * 24 * 365 // 1 year
+const READER_LOCATION_STORAGE_PREFIX = 'mfv2:epubreader_v2:lastLocation:'
+const READER_VARIANT_STORAGE_PREFIX = 'mfv2:epubreader_v2:variant:'
+const READER_PENDING_TRANSLATE_STORAGE_PREFIX =
+  'mfv2:epubreader_v2:pendingTranslate:'
+
+/** Supported file formats for book uploads */
+const SUPPORTED_UPLOAD_FORMATS = {
+  extensions: ['.epub'],
+  mimeTypes: ['application/epub+zip'],
+  accept: '.epub,application/epub+zip',
+} as const
+
+function isValidUploadFile(file: File): boolean {
+  const name = file.name.toLowerCase()
+  const hasValidExtension = SUPPORTED_UPLOAD_FORMATS.extensions.some((ext) =>
+    name.endsWith(ext),
+  )
+  const hasValidMimeType = SUPPORTED_UPLOAD_FORMATS.mimeTypes.includes(
+    file.type as (typeof SUPPORTED_UPLOAD_FORMATS.mimeTypes)[number],
+  )
+  return hasValidExtension || hasValidMimeType
+}
+
+function BookThumbnail(props: { src: string; alt: string }) {
+  const [errored, setErrored] = useState(false)
+
+  if (errored || props.src.trim() === '') {
+    return (
+      <div className="h-16 w-12 rounded-sm border border-[color:var(--accent-soft)] bg-[color:var(--paper-deep)]" />
+    )
+  }
+
+  return (
+    <img
+      src={props.src}
+      alt={props.alt}
+      loading="lazy"
+      className="h-16 w-12 rounded-sm border border-[color:var(--accent-soft)] object-cover bg-[color:var(--paper-deep)]"
+      onError={() => setErrored(true)}
+    />
+  )
+}
+
+function isBookRefNavDebugEnabled() {
+  if (typeof window === 'undefined') return false
+  if ((window as any).__MFV2_DEBUG_CHAT_MENTIONS) return true
+  try {
+    return window.localStorage?.getItem('mfv2_debug_chat_mentions') === '1'
+  } catch {
+    return false
+  }
+}
+
+function debugBookRefNav(...args: Array<unknown>) {
+  if (!isBookRefNavDebugEnabled()) return
+  // eslint-disable-next-line no-console
+  console.log('[mfv2][bookRefNav]', ...args)
+}
+
+function clearPersonalBookClientState(bookId: string) {
+  if (typeof window === 'undefined' || typeof localStorage === 'undefined')
+    return
+
+  const baseId = String(bookId ?? '').trim()
+  if (!baseId) return
+
+  let pendingTranslateVariants: string[] = []
+  try {
+    const raw = localStorage.getItem(
+      `${READER_PENDING_TRANSLATE_STORAGE_PREFIX}${baseId}`,
+    )
+    const parsed = raw ? JSON.parse(raw) : null
+    if (Array.isArray(parsed)) {
+      pendingTranslateVariants = parsed
+        .map((v) => String(v ?? '').trim())
+        .filter(Boolean)
+    }
+  } catch {
+    // ignore
+  }
+
+  try {
+    localStorage.removeItem(`${READER_LOCATION_STORAGE_PREFIX}${baseId}`)
+    localStorage.removeItem(`${READER_VARIANT_STORAGE_PREFIX}${baseId}`)
+    localStorage.removeItem(`${READER_PENDING_TRANSLATE_STORAGE_PREFIX}${baseId}`)
+
+    // Legacy keys: location persisted per-variant.
+    localStorage.removeItem(`${READER_LOCATION_STORAGE_PREFIX}${baseId}@original`)
+    localStorage.removeItem(`${READER_LOCATION_STORAGE_PREFIX}${baseId}@modernify`)
+    for (const variant of pendingTranslateVariants) {
+      localStorage.removeItem(
+        `${READER_LOCATION_STORAGE_PREFIX}${baseId}@${variant}`,
+      )
+    }
+  } catch {
+    // ignore
+  }
+}
 
 export const Route = createFileRoute('/')({
   component: App,
   loader: async () => {
-    let initialWidth = DEFAULT_PANEL_WIDTH
+    let initialWidth: number | undefined
     let initialSelectedBookId: string | null = null
-    let initialPanelVisible = true
-    let initialChatWidth = DEFAULT_CHAT_PANEL_WIDTH
-    let initialChatVisible = false
+    let initialPanelVisible: boolean | undefined
+    let initialChatWidth: number | undefined
+    let initialChatVisible: boolean | undefined
+    let initialLibraryScope: 'public' | 'personal' | undefined
+    let initialLeftPanelView: 'library' | 'books' | undefined
 
     if (import.meta.env.SSR) {
+      initialWidth = DEFAULT_PANEL_WIDTH
+      initialPanelVisible = true
+      initialChatWidth = DEFAULT_CHAT_PANEL_WIDTH
+      initialChatVisible = false
+
       const { getRequest } = await import('@tanstack/react-start/server')
       const req = getRequest()
       const raw = getCookieValue(
@@ -144,6 +271,28 @@ export const Route = createFileRoute('/')({
       if (selectedRaw) {
         initialSelectedBookId = safeDecodeCookieValue(selectedRaw)
       }
+
+      const libraryScopeRaw = getCookieValue(
+        req.headers.get('cookie'),
+        LIBRARY_SCOPE_COOKIE,
+      )
+      if (libraryScopeRaw) {
+        const decoded = safeDecodeCookieValue(libraryScopeRaw)
+        if (decoded === 'public' || decoded === 'personal') {
+          initialLibraryScope = decoded
+        }
+      }
+
+      const leftPanelViewRaw = getCookieValue(
+        req.headers.get('cookie'),
+        LEFT_PANEL_VIEW_COOKIE,
+      )
+      if (leftPanelViewRaw) {
+        const decoded = safeDecodeCookieValue(leftPanelViewRaw)
+        if (decoded === 'library' || decoded === 'books') {
+          initialLeftPanelView = decoded
+        }
+      }
     }
 
     return {
@@ -152,6 +301,8 @@ export const Route = createFileRoute('/')({
       initialPanelVisible,
       initialChatWidth,
       initialChatVisible,
+      initialLibraryScope,
+      initialLeftPanelView,
     }
   },
 })
@@ -163,6 +314,8 @@ function App() {
     initialPanelVisible,
     initialChatWidth,
     initialChatVisible,
+    initialLibraryScope,
+    initialLeftPanelView,
   } = Route.useLoaderData()
   const queryClient = useQueryClient()
   const isMac = useMemo(() => {
@@ -250,13 +403,53 @@ function App() {
       : `${window.location.pathname}${window.location.search}`
   const googleLoginHref = `${apiBaseUrl()}/auth/google/start?redirect=${encodeURIComponent(redirectAfterLogin)}`
 
-  const [libraryScope, setLibraryScope] = useState<'public' | 'personal'>(
-    'public',
+  const [libraryScope, setLibraryScopeState] = useState<'public' | 'personal'>(
+    () => {
+      if (initialLibraryScope) return initialLibraryScope
+      if (typeof document === 'undefined') return 'public'
+      const scopeRaw = getCookieValue(document.cookie, LIBRARY_SCOPE_COOKIE)
+      const decoded = scopeRaw ? safeDecodeCookieValue(scopeRaw) : null
+      return decoded === 'personal' || decoded === 'public' ? decoded : 'public'
+    },
   )
-  const [leftPanelView, setLeftPanelView] = useState<'library' | 'books'>(
-    'books',
+  const [leftPanelView, setLeftPanelViewState] = useState<'library' | 'books'>(
+    () => {
+      if (initialLeftPanelView) return initialLeftPanelView
+      if (typeof document === 'undefined') return 'books'
+      const viewRaw = getCookieValue(document.cookie, LEFT_PANEL_VIEW_COOKIE)
+      const decoded = viewRaw ? safeDecodeCookieValue(viewRaw) : null
+      return decoded === 'library' || decoded === 'books' ? decoded : 'books'
+    },
   )
+
+  const setLibraryScopeCookie = (scope: 'public' | 'personal') => {
+    if (typeof document === 'undefined') return
+    const encoded = encodeURIComponent(scope)
+    document.cookie = `${LIBRARY_SCOPE_COOKIE}=${encoded}; Max-Age=${PANEL_PREFERENCE_MAX_AGE}; Path=/`
+  }
+
+  const setLeftPanelViewCookie = (view: 'library' | 'books') => {
+    if (typeof document === 'undefined') return
+    const encoded = encodeURIComponent(view)
+    document.cookie = `${LEFT_PANEL_VIEW_COOKIE}=${encoded}; Max-Age=${PANEL_PREFERENCE_MAX_AGE}; Path=/`
+  }
+
+  const updateLibraryScope = (scope: 'public' | 'personal') => {
+    setLibraryScopeState(scope)
+    setLibraryScopeCookie(scope)
+  }
+
+  const updateLeftPanelView = (view: 'library' | 'books') => {
+    setLeftPanelViewState(view)
+    setLeftPanelViewCookie(view)
+  }
+
   const [libraryQuery, setLibraryQuery] = useState('')
+  const [deleteBookError, setDeleteBookError] = useState<string | null>(null)
+  const [bookPendingDelete, setBookPendingDelete] = useState<{
+    id: string
+    title: string
+  } | null>(null)
   const libraryLimit = 50
   const booksQuery = useInfiniteCursorQuery<Book>({
     queryKey: ['books', 'search', libraryScope, libraryQuery],
@@ -276,11 +469,34 @@ function App() {
   const uploadMutation = useMutation({
     mutationFn: async (file: File) => uploadBook({ file }),
     onSuccess: async (book) => {
-      setLibraryScope('personal')
-      setLeftPanelView('books')
-      await queryClient.invalidateQueries({ queryKey: ['books', 'search', 'personal'] })
+      updateLibraryScope('personal')
+      updateLeftPanelView('books')
+      await queryClient.invalidateQueries({
+        queryKey: ['books', 'search', 'personal'],
+      })
       updateSelectedBook(book.id)
       listScrollRef.current?.scrollTo({ top: 0 })
+    },
+  })
+  const deleteBookMutation = useMutation({
+    mutationFn: async (bookId: string) => {
+      setDeleteBookError(null)
+      await deleteBook(bookId)
+    },
+    onSuccess: async (_data, bookId) => {
+      clearPersonalBookClientState(bookId)
+      queryClient.removeQueries({ queryKey: ['book', bookId] })
+      if (selectedBookId === bookId) {
+        updateSelectedBook(null)
+      }
+      await queryClient.invalidateQueries({
+        queryKey: ['books', 'search', 'personal'],
+      })
+    },
+    onError: (err) => {
+      setDeleteBookError(
+        err instanceof Error ? err.message : 'Failed to delete book.',
+      )
     },
   })
   const listCount = books.length
@@ -412,7 +628,11 @@ function App() {
     [],
   )
   const getCurrentReaderPageParts = useCallback(
-    (options?: { maxChars?: number; maxImages?: number; maxImageBytes?: number }) =>
+    (options?: {
+      maxChars?: number
+      maxImages?: number
+      maxImageBytes?: number
+    }) =>
       readerRef.current?.getVisiblePageParts(options) ?? Promise.resolve(null),
     [],
   )
@@ -608,6 +828,7 @@ function App() {
         }
       | { bookId: string; href: string },
   ) => {
+    debugBookRefNav('navigateBookRef:incoming', payload)
     const stripVariantSuffix = (raw: string) => {
       const id = raw.trim()
       const idx = id.lastIndexOf('@')
@@ -700,9 +921,19 @@ function App() {
       targetBookId,
     )
 
+    debugBookRefNav('navigateBookRef:resolved', {
+      rawBookId: payload.bookId,
+      targetBookId,
+      canonicalBookId,
+    })
+
     updateSelectedBook(targetBookId)
 
     if (typeof (payload as any).href === 'string') {
+      debugBookRefNav('navigateBookRef:pending:set', {
+        bookId: canonicalBookId,
+        href: String((payload as any).href),
+      })
       setPendingReaderNavigation({
         id: createInsertId(),
         bookId: canonicalBookId,
@@ -717,9 +948,23 @@ function App() {
     const spineIndex = Number((payload as any).spineIndex)
     const textOffset = Number((payload as any).textOffset)
     if (!Number.isFinite(spineIndex) || !Number.isFinite(textOffset)) {
+      debugBookRefNav('navigateBookRef:pending:invalid', {
+        bookId: canonicalBookId,
+        spineIndex: (payload as any).spineIndex,
+        textOffset: (payload as any).textOffset,
+      })
       return
     }
 
+    debugBookRefNav('navigateBookRef:pending:set', {
+      bookId: canonicalBookId,
+      spineIndex: Math.max(0, Math.floor(spineIndex)),
+      textOffset: Math.max(0, Math.floor(textOffset)),
+      selectedTextPrefix:
+        typeof (payload as any).selectedText === 'string'
+          ? String((payload as any).selectedText).slice(0, 80)
+          : '',
+    })
     setPendingReaderNavigation({
       id: createInsertId(),
       bookId: canonicalBookId,
@@ -1364,8 +1609,8 @@ function App() {
                     <button
                       type="button"
                       onClick={() => {
-                        setLibraryScope('public')
-                        setLeftPanelView('books')
+                        updateLibraryScope('public')
+                        updateLeftPanelView('books')
                         listScrollRef.current?.scrollTo({ top: 0 })
                       }}
                       className={[
@@ -1382,8 +1627,8 @@ function App() {
                       type="button"
                       onClick={() => {
                         if (!me) return
-                        setLibraryScope('personal')
-                        setLeftPanelView('books')
+                        updateLibraryScope('personal')
+                        updateLeftPanelView('books')
                         listScrollRef.current?.scrollTo({ top: 0 })
                       }}
                       disabled={!me}
@@ -1405,7 +1650,7 @@ function App() {
                   <div className="h-6 flex items-center justify-between gap-2 px-2 border-b border-[color:var(--accent-soft)] text-[10px] text-[color:var(--ink)]/60">
                     <button
                       type="button"
-                      onClick={() => setLeftPanelView('library')}
+                      onClick={() => updateLeftPanelView('library')}
                       className="flex items-center gap-1 hover:text-[color:var(--ink)] transition-colors"
                       aria-label="Back to Library"
                     >
@@ -1420,7 +1665,7 @@ function App() {
                           <input
                             ref={uploadInputRef}
                             type="file"
-                            accept=".epub,application/epub+zip"
+                            accept={SUPPORTED_UPLOAD_FORMATS.accept}
                             className="hidden"
                             onChange={(e) => {
                               const file = e.target.files?.[0]
@@ -1434,7 +1679,7 @@ function App() {
                             onClick={() => uploadInputRef.current?.click()}
                             disabled={uploadMutation.isPending}
                             className={[
-                              'inline-flex items-center gap-1 rounded-md border border-[color:var(--accent-soft)] bg-[color:var(--paper)] px-2 py-1 text-[10px] text-[color:var(--ink)]/70 hover:bg-[color:var(--paper-deep)] transition-colors',
+                              'flex items-center gap-1 hover:text-[color:var(--ink)] transition-colors',
                               uploadMutation.isPending
                                 ? 'opacity-60 cursor-not-allowed'
                                 : '',
@@ -1443,9 +1688,11 @@ function App() {
                             {uploadMutation.isPending ? (
                               <Loader2 className="w-3 h-3 animate-spin" />
                             ) : (
-                              <Upload className="w-3 h-3" />
+                              <>
+                                <Upload className="w-3 h-3" />
+                              </>
                             )}
-                            Upload
+                            <span>Upload</span>
                           </button>
                         </>
                       )}
@@ -1462,7 +1709,12 @@ function App() {
                   ) : (
                     <div
                       ref={listScrollRef}
-                      className="flex-1 overflow-y-auto"
+                      role="region"
+                      aria-label="Book list"
+                      className={[
+                        'flex-1 overflow-y-auto transition-colors',
+                        uploadDragActive ? 'bg-[color:var(--accent)]/10' : '',
+                      ].join(' ')}
                       onDragEnter={(e) => {
                         if (libraryScope !== 'personal' || !me) return
                         e.preventDefault()
@@ -1482,6 +1734,7 @@ function App() {
                         setUploadDragActive(false)
                         const file = e.dataTransfer.files?.[0]
                         if (!file) return
+                        if (!isValidUploadFile(file)) return
                         uploadMutation.mutate(file)
                       }}
                       onScroll={(e) => {
@@ -1514,6 +1767,11 @@ function App() {
                             : 'Upload failed.'}
                         </div>
                       )}
+                      {deleteBookError && (
+                        <div className="px-3 text-[color:var(--accent)] py-2 text-xs">
+                          {deleteBookError}
+                        </div>
+                      )}
                       {!booksQuery.isLoading &&
                         !booksQuery.error &&
                         books.length === 0 && (
@@ -1525,16 +1783,20 @@ function App() {
                       {!booksQuery.isLoading && !booksQuery.error && (
                         <div
                           style={{
-                            height: `${rowVirtualizer.getTotalSize()}px`,
+                            // height: `${rowVirtualizer.getTotalSize()}px`,
+                            height: '100%',
                             width: '100%',
                             position: 'relative',
                           }}
                         >
-                          {uploadDragActive && libraryScope === 'personal' && me && (
-                            <div className="absolute inset-2 z-10 rounded-lg border border-dashed border-[color:var(--accent)] bg-[color:var(--paper)]/80 backdrop-blur-sm flex items-center justify-center text-xs text-[color:var(--ink)]/70">
-                              Drop an EPUB to upload
-                            </div>
-                          )}
+                          {uploadDragActive &&
+                            libraryScope === 'personal' &&
+                            me !== null && (
+                              <div className="text-sm text-[color:var(--ink)]/70 h-full flex-1 flex flex-col items-center gap-1 justify-center">
+                                <Upload className="w-5 h-5 text-[color:var(--accent)]" />
+                                <span>Drop EPUB to upload</span>
+                              </div>
+                            )}
                           {rowVirtualizer
                             .getVirtualItems()
                             .map((virtualRow) => {
@@ -1587,34 +1849,83 @@ function App() {
                                         book.authors
                                           .filter(Boolean)
                                           .join(', ') || 'Unknown author'
-                                      const hasThumbnail = Boolean(
-                                        book.thumbnail_url.trim(),
-                                      )
+                                      const thumbnailSrc =
+                                        book.visibility === 'private' ||
+                                        book.thumbnail_url.trim() === ''
+                                          ? getBookThumbnailUrl(book.id)
+                                          : book.thumbnail_url
                                       const isSelected =
                                         selectedBookId === book.id
+                                      const canDeletePersonalBook =
+                                        libraryScope === 'personal' &&
+                                        Boolean(me) &&
+                                        book.owner_user_id === me?.id
 
                                       return (
                                         <HoverCard
                                           openDelay={150}
                                           closeDelay={75}
                                         >
-                                          <HoverCardTrigger asChild>
-                                            <button
-                                              type="button"
-                                              onClick={() =>
-                                                updateSelectedBook(book.id)
-                                              }
-                                              className={[
-                                                'block w-full px-3 py-1 text-left text-xs transition-colors truncate',
-                                                isSelected
-                                                  ? 'bg-[color:var(--paper-deep)] text-[color:var(--ink)]'
-                                                  : 'text-[color:var(--ink)]/90 hover:bg-[color:var(--paper-deep)]',
-                                              ].join(' ')}
-                                              aria-pressed={isSelected}
-                                            >
-                                              {title}
-                                            </button>
-                                          </HoverCardTrigger>
+                                          <div
+                                            className={[
+                                              'flex items-center gap-1 pr-1',
+                                              isSelected
+                                                ? 'bg-[color:var(--paper-deep)]'
+                                                : 'hover:bg-[color:var(--paper-deep)]',
+                                            ].join(' ')}
+                                          >
+                                            <HoverCardTrigger asChild>
+                                              <button
+                                                type="button"
+                                                onClick={() =>
+                                                  updateSelectedBook(book.id)
+                                                }
+                                                className={[
+                                                  'flex-1 min-w-0 px-3 py-1 text-left text-xs transition-colors truncate',
+                                                  isSelected
+                                                    ? 'text-[color:var(--ink)]'
+                                                    : 'text-[color:var(--ink)]/90',
+                                                ].join(' ')}
+                                                aria-pressed={isSelected}
+                                              >
+                                                {title}
+                                              </button>
+                                            </HoverCardTrigger>
+                                            {canDeletePersonalBook && (
+                                              <button
+                                                type="button"
+                                                className={[
+                                                  'shrink-0 rounded-md p-1 transition-colors',
+                                                  'text-[color:var(--ink)]/50 hover:text-[color:var(--accent)]',
+                                                  deleteBookMutation.isPending &&
+                                                  deleteBookMutation.variables ===
+                                                    book.id
+                                                    ? 'opacity-60 cursor-not-allowed'
+                                                    : '',
+                                                ].join(' ')}
+                                                aria-label={`Delete ${title}`}
+                                                disabled={
+                                                  deleteBookMutation.isPending
+                                                }
+                                                onClick={(e) => {
+                                                  e.preventDefault()
+                                                  e.stopPropagation()
+                                                  setBookPendingDelete({
+                                                    id: book.id,
+                                                    title,
+                                                  })
+                                                }}
+                                              >
+                                                {deleteBookMutation.isPending &&
+                                                deleteBookMutation.variables ===
+                                                  book.id ? (
+                                                  <Loader2 className="w-3 h-3 animate-spin" />
+                                                ) : (
+                                                  <Trash2 className="w-3 h-3" />
+                                                )}
+                                              </button>
+                                            )}
+                                          </div>
                                           <HoverCardContent
                                             side="right"
                                             align="start"
@@ -1623,16 +1934,11 @@ function App() {
                                           >
                                             <div className="flex gap-3">
                                               <div className="shrink-0">
-                                                {hasThumbnail ? (
-                                                  <img
-                                                    src={book.thumbnail_url}
-                                                    alt={title}
-                                                    loading="lazy"
-                                                    className="h-16 w-12 rounded-sm border border-[color:var(--accent-soft)] object-cover bg-[color:var(--paper-deep)]"
-                                                  />
-                                                ) : (
-                                                  <div className="h-16 w-12 rounded-sm border border-[color:var(--accent-soft)] bg-[color:var(--paper-deep)]" />
-                                                )}
+                                                <BookThumbnail
+                                                  key={`${book.id}:${thumbnailSrc}`}
+                                                  src={thumbnailSrc}
+                                                  alt={title}
+                                                />
                                               </div>
                                               <div className="min-w-0">
                                                 <div className="text-sm font-medium leading-snug">
@@ -1750,6 +2056,37 @@ function App() {
           </ResizableWindow>
         </div>
       </div>
+
+      <AlertDialog
+        open={bookPendingDelete !== null}
+        onOpenChange={(open) => {
+          if (!open) setBookPendingDelete(null)
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Delete book</AlertDialogTitle>
+            <AlertDialogDescription>
+              Delete "{bookPendingDelete?.title}" from your personal library?
+              This will remove it from your browser state, the database, and
+              storage.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={() => {
+                if (bookPendingDelete) {
+                  deleteBookMutation.mutate(bookPendingDelete.id)
+                }
+                setBookPendingDelete(null)
+              }}
+            >
+              Delete
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   )
 }

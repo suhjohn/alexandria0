@@ -46,6 +46,11 @@ export function getBookFileUrl(
   return `${base}/books/${encodeURIComponent(bookId)}/file${suffix}`
 }
 
+export function getBookThumbnailUrl(bookId: string): string {
+  const base = apiBase()
+  return `${base}/books/${encodeURIComponent(bookId)}/thumbnail`
+}
+
 export const getBooks = createServerFn({
   method: 'GET',
 }).handler(async (): Promise<Book[]> => {
@@ -114,6 +119,20 @@ export async function uploadBook(options: {
     throw new Error(text || 'Failed to upload book')
   }
   return response.json()
+}
+
+export async function deleteBook(bookId: string): Promise<void> {
+  const response = await fetch(`${apiBase()}/books/${encodeURIComponent(bookId)}`, {
+    method: 'DELETE',
+    credentials: 'include',
+  })
+
+  if (response.status === 204 || response.status === 404) return
+
+  if (!response.ok) {
+    const text = await response.text().catch(() => '')
+    throw new Error(text || 'Failed to delete book')
+  }
 }
 
 export const startBookTransform = async (

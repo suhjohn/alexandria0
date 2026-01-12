@@ -173,6 +173,22 @@ function elementLikelyContainsText(el: Element, expectedText: string): boolean {
   return haystack.includes(shortSig)
 }
 
+function isReaderNavDebugEnabled() {
+  if (typeof window === 'undefined') return false
+  if ((window as any).__MFV2_DEBUG_CHAT_MENTIONS) return true
+  try {
+    return window.localStorage?.getItem('mfv2_debug_chat_mentions') === '1'
+  } catch {
+    return false
+  }
+}
+
+function debugReaderNav(...args: Array<unknown>) {
+  if (!isReaderNavDebugEnabled()) return
+  // eslint-disable-next-line no-console
+  console.log('[mfv2][readerNav]', ...args)
+}
+
 type CaretPoint = { node: Text; offset: number }
 
 function extractVisibleTextByCaret(options: {
@@ -2220,11 +2236,12 @@ const EpubReaderV2Inner = forwardRef<
       let lastText: Text | null = null
       while (walker.nextNode()) {
         const node = walker.currentNode as Text
-        lastText = node
         const len = node.nodeValue?.length ?? 0
-        if (remaining <= len) {
-          return { node, offset: remaining }
-        }
+        if (len <= 0) continue
+        lastText = node
+        // If `remaining` is exactly at the end of this node, advance to the next
+        // text node (so we don't "land" on a trailing whitespace-only node).
+        if (remaining < len) return { node, offset: remaining }
         remaining -= len
       }
       if (lastText) {
@@ -2255,11 +2272,63 @@ const EpubReaderV2Inner = forwardRef<
         return false
       }
 
+      // Use a DOM Range at the exact text offset to compute the target page.
+      // Using the parent element can land on the start of a long paragraph that
+      // spans multiple pages/columns.
+      const rangeRect = (() => {
+        const node = pos.node
+        const value = node.nodeValue ?? ''
+        const len = value.length
+        if (len <= 0) return null
+
+        const pivot = clamp(Math.floor(pos.offset), 0, Math.max(0, len - 1))
+        const getRectFor = (start: number, end: number) => {
+          const range = doc.createRange()
+          try {
+            range.setStart(node, clamp(start, 0, len))
+            range.setEnd(node, clamp(end, 0, len))
+          } catch {
+            return null
+          }
+          const rects = Array.from(range.getClientRects?.() ?? [])
+          const rect =
+            rects.find((r) => r.width > 0 || r.height > 0) ?? rects[0] ?? null
+          if (rect && (rect.width > 0 || rect.height > 0)) return rect
+          const fallback = range.getBoundingClientRect?.() ?? null
+          if (fallback && (fallback.width > 0 || fallback.height > 0))
+            return fallback
+          return null
+        }
+
+        // `getClientRects()` is often empty for whitespace-only ranges. Scan for
+        // the nearest non-whitespace character around the desired offset.
+        const isWhitespaceChar = (ch: string) => /\s/.test(ch)
+        const maxStep = 48
+
+        for (let step = 0; step <= maxStep; step++) {
+          const candidates =
+            step === 0 ? [pivot] : [pivot + step, pivot - step]
+          for (const idx of candidates) {
+            if (idx < 0 || idx >= len) continue
+            if (step < maxStep && isWhitespaceChar(value[idx] ?? '')) continue
+            const rect = getRectFor(idx, idx + 1)
+            if (rect) return rect
+          }
+        }
+
+        // As a last resort, try a small window (helps with runs of whitespace).
+        const windowEnd = clamp(pivot + 16, 0, len)
+        const rect = getRectFor(pivot, windowEnd)
+        if (rect) return rect
+        return null
+      })()
+
       const href = publication?.spine[spineIndex]?.href ?? ''
 
       if (settings.flowMode === 'scrolled') {
         const viewportRect = layout.viewportEl.getBoundingClientRect()
-        const rect = (el as HTMLElement).getBoundingClientRect()
+        const rect =
+          rangeRect ?? (el as HTMLElement).getBoundingClientRect()
         const targetTop =
           rect.top - viewportRect.top + layout.viewportEl.scrollTop
         layout.viewportEl.scrollTo({
@@ -2275,10 +2344,41 @@ const EpubReaderV2Inner = forwardRef<
         return true
       }
 
-      const chapterPageIndex = findPageIndexForElement({
-        layout,
-        element: el,
+      const chapterPageIndex = (() => {
+        if (!rangeRect) {
+          return findPageIndexForElement({ layout, element: el })
+        }
+        const viewportRect = layout.viewportEl.getBoundingClientRect()
+        const absoluteLeft =
+          rangeRect.left - viewportRect.left + layout.viewportEl.scrollLeft
+        return clamp(
+          Math.floor(absoluteLeft / layout.pageWidth),
+          0,
+          Math.max(0, layout.totalPages - 1),
+        )
+      })()
+      debugReaderNav('goToTextOffsetInCurrentDoc', {
+        spineIndex,
+        textOffset,
+        foundTextOffsetInNode: pos.offset,
+        nodeLen: pos.node.nodeValue?.length ?? 0,
+        nodePreview: (pos.node.nodeValue ?? '').slice(
+          Math.max(0, pos.offset - 24),
+          pos.offset + 24,
+        ),
+        usedRangeRect: Boolean(rangeRect),
+        rangeRectLeft: rangeRect ? Math.round(rangeRect.left) : null,
+        chapterPageIndex,
+        totalPages: layout.totalPages,
+        expectedTextPrefix: expectedText ? expectedText.slice(0, 80) : '',
       })
+      if (!rangeRect && expectedText) {
+        debugReaderNav('goToTextOffsetInCurrentDoc:noRangeRect', {
+          spineIndex,
+          textOffset,
+          expectedTextPrefix: expectedText.slice(0, 80),
+        })
+      }
       scrollToPage({
         layout,
         pageIndex: chapterPageIndex,
@@ -2334,6 +2434,12 @@ const EpubReaderV2Inner = forwardRef<
 
         const sel = doc.defaultView?.getSelection?.() ?? null
         if (!sel || sel.rangeCount === 0) return true
+        let range: Range | null = null
+        try {
+          range = sel.getRangeAt(0)
+        } catch {
+          range = null
+        }
         let node: Node | null = null
         try {
           node = sel.getRangeAt(0).startContainer ?? null
@@ -2346,11 +2452,24 @@ const EpubReaderV2Inner = forwardRef<
             : node?.parentElement ?? null
         if (!el) return true
 
+        const rangeRect = (() => {
+          if (!range) return null
+          const rects = Array.from(range.getClientRects?.() ?? [])
+          const rect =
+            rects.find((r) => r.width > 0 || r.height > 0) ?? rects[0] ?? null
+          if (rect && (rect.width > 0 || rect.height > 0)) return rect
+          const fallback = range.getBoundingClientRect?.() ?? null
+          if (fallback && (fallback.width > 0 || fallback.height > 0))
+            return fallback
+          return null
+        })()
+
         const href = publication?.spine[spineIndex]?.href ?? ''
 
         if (settings.flowMode === 'scrolled') {
           const viewportRect = layout.viewportEl.getBoundingClientRect()
-          const rect = (el as HTMLElement).getBoundingClientRect()
+          const rect =
+            rangeRect ?? (el as HTMLElement).getBoundingClientRect()
           const targetTop =
             rect.top - viewportRect.top + layout.viewportEl.scrollTop
           layout.viewportEl.scrollTo({
@@ -2366,9 +2485,26 @@ const EpubReaderV2Inner = forwardRef<
           return true
         }
 
-        const chapterPageIndex = findPageIndexForElement({
-          layout,
-          element: el,
+        const chapterPageIndex = (() => {
+          if (!rangeRect) {
+            return findPageIndexForElement({ layout, element: el })
+          }
+          const viewportRect = layout.viewportEl.getBoundingClientRect()
+          const absoluteLeft =
+            rangeRect.left - viewportRect.left + layout.viewportEl.scrollLeft
+          return clamp(
+            Math.floor(absoluteLeft / layout.pageWidth),
+            0,
+            Math.max(0, layout.totalPages - 1),
+          )
+        })()
+        debugReaderNav('goToTextSearchInCurrentDoc', {
+          spineIndex,
+          needlePrefix: needle.slice(0, 40),
+          usedRangeRect: Boolean(rangeRect),
+          rangeRectLeft: rangeRect ? Math.round(rangeRect.left) : null,
+          chapterPageIndex,
+          totalPages: layout.totalPages,
         })
         scrollToPage({
           layout,
@@ -3753,6 +3889,20 @@ const EpubReaderV2Inner = forwardRef<
       return
     }
 
+    debugReaderNav('pendingNavigation:received', {
+      id: pendingNavigation.id,
+      bookId: pendingNavigation.bookId,
+      spineIndex: pendingNavigation.spineIndex,
+      textOffset: pendingNavigation.textOffset,
+      href: pendingNavigation.href,
+      selectedTextPrefix: String(pendingNavigation.selectedText ?? '').slice(
+        0,
+        80,
+      ),
+      currentSpineIndex: spineIndex,
+      currentVariant: variantRef.current,
+    })
+
     if (pendingBook.variant && pendingBook.variant !== variantRef.current) {
       const target = pendingBook.variant
       const fromStatus =
@@ -3776,6 +3926,10 @@ const EpubReaderV2Inner = forwardRef<
         return
       }
       goToHrefRef.current(pendingNavigation.href, 'auto')
+      debugReaderNav('pendingNavigation:consume', {
+        id: pendingNavigation.id,
+        kind: 'href',
+      })
       onConsumePendingNavigationRef.current?.(pendingNavigation.id)
       return
     }
@@ -3788,6 +3942,13 @@ const EpubReaderV2Inner = forwardRef<
 
     const targetSpineIndex = pendingNavigation.spineIndex ?? spineIndex
     if (targetSpineIndex !== spineIndex) {
+      debugReaderNav('pendingNavigation:loadSpine', {
+        id: pendingNavigation.id,
+        fromSpineIndex: spineIndex,
+        toSpineIndex: targetSpineIndex,
+        textOffset,
+        selectedTextPrefix: selectedText.slice(0, 80),
+      })
       loadSpine(targetSpineIndex, {
         pageIndex: 0,
         behavior: 'auto',
@@ -3803,6 +3964,13 @@ const EpubReaderV2Inner = forwardRef<
       (selectedText
         ? goToTextSearchInCurrentDoc(selectedText, 'auto')
         : false)
+    debugReaderNav('pendingNavigation:applyInDoc', {
+      id: pendingNavigation.id,
+      spineIndex,
+      textOffset,
+      ok,
+      selectedTextPrefix: selectedText.slice(0, 80),
+    })
     if (ok) {
       onConsumePendingNavigationRef.current?.(pendingNavigation.id)
       return

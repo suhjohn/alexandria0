@@ -1,20 +1,20 @@
-import { hasUrlScheme } from '../utils/path';
-import { isAllowedInlineUrl, isEpubCfiHref } from '../utils/url';
-import { EpubResourceStore } from './resources';
-import { ensureReaderContainers } from './containers';
+import { hasUrlScheme } from '../utils/path'
+import { isAllowedInlineUrl, isEpubCfiHref } from '../utils/url'
+import { EpubResourceStore } from './resources'
+import { ensureReaderContainers } from './containers'
 
 const BASE_CSP = [
   "default-src 'none'",
   "script-src 'none'",
-  "img-src blob: data:",
+  'img-src blob: data:',
   "style-src 'unsafe-inline' blob:",
-  "font-src blob: data:",
-  "media-src blob: data:",
+  'font-src blob: data:',
+  'media-src blob: data:',
   "object-src 'none'",
   "frame-src 'none'",
   "base-uri 'none'",
   "form-action 'none'",
-].join('; ');
+].join('; ')
 
 const BASE_STYLE = `
 :root {
@@ -35,21 +35,21 @@ html, body {
   padding: 0;
   width: var(--mfv2-vw);
   height: var(--mfv2-vh);
-  background: var(--mfv2-bg);
-  color: var(--mfv2-fg);
+  background: var(--mfv2-bg) !important;
+  color: var(--mfv2-fg) !important;
   overflow: hidden;
 }
 
 body {
   -webkit-text-size-adjust: 100%;
-  font-size: calc(100% * var(--mfv2-font-scale));
-  line-height: var(--mfv2-line-height);
-  font-family: var(--mfv2-font-family);
-  text-align: var(--mfv2-text-align);
+  font-size: calc(100% * var(--mfv2-font-scale)) !important;
+  line-height: var(--mfv2-line-height) !important;
+  font-family: var(--mfv2-font-family) !important;
+  text-align: var(--mfv2-text-align) !important;
 }
 
-a[href] { color: var(--mfv2-link); text-decoration: none; }
-a[href]:hover { color: var(--mfv2-link); opacity: 0.8; }
+a[href] { color: var(--mfv2-link) !important; text-decoration: none; }
+a[href]:hover { color: var(--mfv2-link) !important; opacity: 0.8; }
 a[href]:focus { outline: none; }
 a:not([href]) { color: inherit; text-decoration: inherit; }
 *:focus { outline: none; }
@@ -61,6 +61,7 @@ a:not([href]) { color: inherit; text-decoration: inherit; }
   overflow: hidden;
   overscroll-behavior: contain;
   -webkit-overflow-scrolling: touch;
+  background: var(--mfv2-bg) !important;
 }
 
 #mfv2-book-content {
@@ -68,6 +69,39 @@ a:not([href]) { color: inherit; text-decoration: inherit; }
   column-width: var(--mfv2-vw);
   column-gap: var(--mfv2-gap);
   column-fill: auto;
+}
+
+/*
+  Override publisher CSS so global reader settings always apply.
+  Some EPUBs hard-code colors/backgrounds/font-sizes with high specificity and
+  !important, which can make themes and font scaling appear "broken".
+*/
+#mfv2-book-content {
+  color: var(--mfv2-fg) !important;
+  line-height: var(--mfv2-line-height) !important;
+  text-align: var(--mfv2-text-align) !important;
+}
+
+#mfv2-book-content * {
+  color: inherit !important;
+  background: transparent !important;
+  line-height: inherit !important;
+  text-align: inherit !important;
+}
+
+#mfv2-book-content a[href] {
+  color: var(--mfv2-link) !important;
+}
+
+html:not([data-mfv2-font-family="publisher"]) #mfv2-book-content,
+html:not([data-mfv2-font-family="publisher"]) #mfv2-book-content * {
+  font-family: var(--mfv2-font-family) !important;
+}
+
+@supports (zoom: 1) {
+  /* Use zoom for font scaling so even fixed px text in EPUB CSS scales. */
+  body { font-size: 100% !important; }
+  #mfv2-book-content { zoom: var(--mfv2-font-scale); }
 }
 
 img, svg, video, canvas {
@@ -91,115 +125,135 @@ img.cover {
   margin: 0 auto;
   object-fit: contain !important;
 }
-`;
+`
 
 function removeDangerousNodes(doc: Document) {
-  doc.querySelectorAll('script, iframe, object, embed').forEach((el) => el.remove());
-  doc.querySelectorAll('base').forEach((el) => el.remove());
+  doc
+    .querySelectorAll('script, iframe, object, embed')
+    .forEach((el) => el.remove())
+  doc.querySelectorAll('base').forEach((el) => el.remove())
   for (const el of Array.from(doc.querySelectorAll('*'))) {
     for (const attr of Array.from(el.attributes)) {
-      if (attr.name.toLowerCase().startsWith('on')) el.removeAttribute(attr.name);
+      if (attr.name.toLowerCase().startsWith('on'))
+        el.removeAttribute(attr.name)
     }
   }
 }
 
 function sanitizeAnchor(el: Element) {
-  if (!(el instanceof HTMLAnchorElement)) return;
-  const href = (el.getAttribute('href') ?? '').trim();
-  if (!href) return;
+  if (!(el instanceof HTMLAnchorElement)) return
+  const href = (el.getAttribute('href') ?? '').trim()
+  if (!href) return
   if (hasUrlScheme(href) && !isEpubCfiHref(href)) {
-    el.setAttribute('href', '#');
-    el.setAttribute('data-mf-blocked-href', href);
+    el.setAttribute('href', '#')
+    el.setAttribute('data-mf-blocked-href', href)
   }
 }
 
 async function resolveObjectUrl(options: {
-  basePath: string;
-  href: string;
-  store: EpubResourceStore;
+  basePath: string
+  href: string
+  store: EpubResourceStore
 }): Promise<{ url: string; epubPath: string } | null> {
   const resolved = options.store.resolveEpubHref({
     basePath: options.basePath,
     href: options.href,
-  });
-  if (!resolved) return null;
+  })
+  if (!resolved) return null
   try {
-    const blobUrl = await options.store.getObjectUrl(resolved.path);
+    const blobUrl = await options.store.getObjectUrl(resolved.path)
     return {
       url: resolved.fragment ? `${blobUrl}#${resolved.fragment}` : blobUrl,
       epubPath: resolved.path,
-    };
+    }
   } catch {
-    return null;
+    return null
   }
 }
 
-async function rewriteSrcset(docPath: string, rawSrcset: string, store: EpubResourceStore): Promise<string> {
+async function rewriteSrcset(
+  docPath: string,
+  rawSrcset: string,
+  store: EpubResourceStore,
+): Promise<string> {
   const parts = rawSrcset
     .split(',')
     .map((p) => p.trim())
-    .filter(Boolean);
-  const out: string[] = [];
+    .filter(Boolean)
+  const out: string[] = []
   for (const part of parts) {
-    const [urlPart, descriptor] = part.split(/\s+/, 2);
-    if (!urlPart) continue;
+    const [urlPart, descriptor] = part.split(/\s+/, 2)
+    if (!urlPart) continue
     if (hasUrlScheme(urlPart)) {
-      if (isAllowedInlineUrl(urlPart)) out.push(descriptor ? `${urlPart} ${descriptor}` : urlPart);
-      continue;
+      if (isAllowedInlineUrl(urlPart))
+        out.push(descriptor ? `${urlPart} ${descriptor}` : urlPart)
+      continue
     }
     if (isAllowedInlineUrl(urlPart)) {
-      out.push(descriptor ? `${urlPart} ${descriptor}` : urlPart);
-      continue;
+      out.push(descriptor ? `${urlPart} ${descriptor}` : urlPart)
+      continue
     }
-    const rewritten = await resolveObjectUrl({ basePath: docPath, href: urlPart, store });
-    if (!rewritten) continue;
-    out.push(descriptor ? `${rewritten.url} ${descriptor}` : rewritten.url);
+    const rewritten = await resolveObjectUrl({
+      basePath: docPath,
+      href: urlPart,
+      store,
+    })
+    if (!rewritten) continue
+    out.push(descriptor ? `${rewritten.url} ${descriptor}` : rewritten.url)
   }
-  return out.join(', ');
+  return out.join(', ')
 }
 
 export async function buildSpineItemSrcDoc(options: {
-  spineItemPath: string;
-  xhtmlText: string;
-  resourceStore: EpubResourceStore;
+  spineItemPath: string
+  xhtmlText: string
+  resourceStore: EpubResourceStore
 }): Promise<string> {
-  const { spineItemPath, xhtmlText, resourceStore } = options;
+  const { spineItemPath, xhtmlText, resourceStore } = options
 
-  const doc = new DOMParser().parseFromString(xhtmlText, 'text/html');
-  removeDangerousNodes(doc);
+  const doc = new DOMParser().parseFromString(xhtmlText, 'text/html')
+  removeDangerousNodes(doc)
 
-  for (const link of Array.from(doc.querySelectorAll('link[rel~="stylesheet"][href]'))) {
-    const rawHref = link.getAttribute('href') ?? '';
-    const resolved = resourceStore.resolveEpubHref({ basePath: spineItemPath, href: rawHref });
+  for (const link of Array.from(
+    doc.querySelectorAll('link[rel~="stylesheet"][href]'),
+  )) {
+    const rawHref = link.getAttribute('href') ?? ''
+    const resolved = resourceStore.resolveEpubHref({
+      basePath: spineItemPath,
+      href: rawHref,
+    })
     if (!resolved) {
-      link.remove();
-      continue;
+      link.remove()
+      continue
     }
-    const resolvedCssPath = resolved.path;
+    const resolvedCssPath = resolved.path
     try {
-      const cssText = await resourceStore.readText(resolvedCssPath);
-      const rewritten = await resourceStore.rewriteCssUrls(cssText, resolvedCssPath);
-      const styleEl = doc.createElement('style');
-      styleEl.setAttribute('data-epub-href', resolvedCssPath);
-      styleEl.textContent = rewritten;
-      link.replaceWith(styleEl);
+      const cssText = await resourceStore.readText(resolvedCssPath)
+      const rewritten = await resourceStore.rewriteCssUrls(
+        cssText,
+        resolvedCssPath,
+      )
+      const styleEl = doc.createElement('style')
+      styleEl.setAttribute('data-epub-href', resolvedCssPath)
+      styleEl.textContent = rewritten
+      link.replaceWith(styleEl)
     } catch {
-      link.remove();
+      link.remove()
     }
   }
 
   // Strip other <link href="..."> entries (icons, preloads, etc.) to avoid
   // leaking network requests from srcdoc. We inline stylesheets above.
   for (const link of Array.from(doc.querySelectorAll('link[href]'))) {
-    const rel = (link.getAttribute('rel') ?? '').toLowerCase();
-    if (rel.split(/\s+/).includes('stylesheet')) continue;
-    link.remove();
+    const rel = (link.getAttribute('rel') ?? '').toLowerCase()
+    if (rel.split(/\s+/).includes('stylesheet')) continue
+    link.remove()
   }
 
   for (const style of Array.from(doc.querySelectorAll('style'))) {
-    const css = style.textContent ?? '';
+    const css = style.textContent ?? ''
     try {
-      style.textContent = await resourceStore.rewriteCssUrls(css, spineItemPath);
+      style.textContent = await resourceStore.rewriteCssUrls(css, spineItemPath)
     } catch {
       // Ignore.
     }
@@ -207,99 +261,120 @@ export async function buildSpineItemSrcDoc(options: {
 
   // Rewrite inline style URLs (e.g. background-image: url(...)).
   for (const el of Array.from(doc.querySelectorAll('[style]'))) {
-    const rawStyle = el.getAttribute('style') ?? '';
-    if (!rawStyle || !/url\(/i.test(rawStyle)) continue;
+    const rawStyle = el.getAttribute('style') ?? ''
+    if (!rawStyle || !/url\(/i.test(rawStyle)) continue
     try {
-      const rewritten = await resourceStore.rewriteCssUrls(rawStyle, spineItemPath);
-      el.setAttribute('style', rewritten);
+      const rewritten = await resourceStore.rewriteCssUrls(
+        rawStyle,
+        spineItemPath,
+      )
+      el.setAttribute('style', rewritten)
     } catch {
       // Ignore.
     }
   }
 
-  for (const a of Array.from(doc.querySelectorAll('a[href]'))) sanitizeAnchor(a);
+  for (const a of Array.from(doc.querySelectorAll('a[href]'))) sanitizeAnchor(a)
 
-  const mediaSrcSelectors = ['img[src]', 'audio[src]', 'video[src]', 'source[src]', 'track[src]', '[poster]'];
-  for (const el of Array.from(doc.querySelectorAll(mediaSrcSelectors.join(',')))) {
-    const attr = el.hasAttribute('poster') ? 'poster' : 'src';
-    const raw = (el.getAttribute(attr) ?? '').trim();
-    if (!raw) continue;
+  const mediaSrcSelectors = [
+    'img[src]',
+    'audio[src]',
+    'video[src]',
+    'source[src]',
+    'track[src]',
+    '[poster]',
+  ]
+  for (const el of Array.from(
+    doc.querySelectorAll(mediaSrcSelectors.join(',')),
+  )) {
+    const attr = el.hasAttribute('poster') ? 'poster' : 'src'
+    const raw = (el.getAttribute(attr) ?? '').trim()
+    if (!raw) continue
     if (hasUrlScheme(raw)) {
-      if (!isAllowedInlineUrl(raw)) el.removeAttribute(attr);
-      continue;
+      if (!isAllowedInlineUrl(raw)) el.removeAttribute(attr)
+      continue
     }
-    if (isAllowedInlineUrl(raw)) continue;
+    if (isAllowedInlineUrl(raw)) continue
     const resolved = await resolveObjectUrl({
       basePath: spineItemPath,
       href: raw,
       store: resourceStore,
-    });
+    })
     if (!resolved) {
-      el.removeAttribute(attr);
-      continue;
+      el.removeAttribute(attr)
+      continue
     }
     if (el instanceof HTMLImageElement) {
-      el.setAttribute('data-mfv2-epub-src', resolved.epubPath);
+      el.setAttribute('data-mfv2-epub-src', resolved.epubPath)
     }
-    el.setAttribute(attr, resolved.url);
+    el.setAttribute(attr, resolved.url)
 
     if (el instanceof HTMLImageElement) {
-      el.loading = 'eager';
-      el.decoding = 'sync';
+      el.loading = 'eager'
+      el.decoding = 'sync'
     }
   }
 
-  for (const el of Array.from(doc.querySelectorAll('img[srcset], source[srcset]'))) {
-    const srcset = el.getAttribute('srcset') ?? '';
-    if (!srcset) continue;
+  for (const el of Array.from(
+    doc.querySelectorAll('img[srcset], source[srcset]'),
+  )) {
+    const srcset = el.getAttribute('srcset') ?? ''
+    if (!srcset) continue
     try {
-      const rewritten = await rewriteSrcset(spineItemPath, srcset, resourceStore);
-      if (rewritten) el.setAttribute('srcset', rewritten);
-      else el.removeAttribute('srcset');
+      const rewritten = await rewriteSrcset(
+        spineItemPath,
+        srcset,
+        resourceStore,
+      )
+      if (rewritten) el.setAttribute('srcset', rewritten)
+      else el.removeAttribute('srcset')
     } catch {
       // Ignore.
     }
   }
 
-  for (const image of Array.from(doc.querySelectorAll('image[href], image[xlink\\:href]'))) {
-    const attr = image.getAttribute('href') ? 'href' : 'xlink:href';
-    const raw = (image.getAttribute(attr) ?? '').trim();
-    if (!raw) continue;
+  for (const image of Array.from(
+    doc.querySelectorAll('image[href], image[xlink\\:href]'),
+  )) {
+    const attr = image.getAttribute('href') ? 'href' : 'xlink:href'
+    const raw = (image.getAttribute(attr) ?? '').trim()
+    if (!raw) continue
     if (hasUrlScheme(raw)) {
-      if (!isAllowedInlineUrl(raw)) image.removeAttribute(attr);
-      continue;
+      if (!isAllowedInlineUrl(raw)) image.removeAttribute(attr)
+      continue
     }
-    if (isAllowedInlineUrl(raw)) continue;
+    if (isAllowedInlineUrl(raw)) continue
     const resolved = await resolveObjectUrl({
       basePath: spineItemPath,
       href: raw,
       store: resourceStore,
-    });
+    })
     if (!resolved) {
-      image.removeAttribute(attr);
-      continue;
+      image.removeAttribute(attr)
+      continue
     }
-    image.setAttribute(attr, resolved.url);
+    image.setAttribute(attr, resolved.url)
   }
 
-  const head = doc.head ?? doc.getElementsByTagName('head')[0] ?? doc.documentElement;
-  const csp = doc.createElement('meta');
-  csp.httpEquiv = 'Content-Security-Policy';
-  csp.content = BASE_CSP;
-  head.prepend(csp);
+  const head =
+    doc.head ?? doc.getElementsByTagName('head')[0] ?? doc.documentElement
+  const csp = doc.createElement('meta')
+  csp.httpEquiv = 'Content-Security-Policy'
+  csp.content = BASE_CSP
+  head.prepend(csp)
 
   if (!head.querySelector('meta[charset]')) {
-    const charset = doc.createElement('meta');
-    charset.setAttribute('charset', 'utf-8');
-    head.prepend(charset);
+    const charset = doc.createElement('meta')
+    charset.setAttribute('charset', 'utf-8')
+    head.prepend(charset)
   }
 
-  const baseStyleEl = doc.createElement('style');
-  baseStyleEl.id = 'mfv2-reader-base';
-  baseStyleEl.textContent = BASE_STYLE;
-  head.appendChild(baseStyleEl);
+  const baseStyleEl = doc.createElement('style')
+  baseStyleEl.id = 'mfv2-reader-base'
+  baseStyleEl.textContent = BASE_STYLE
+  head.appendChild(baseStyleEl)
 
-  ensureReaderContainers(doc);
+  ensureReaderContainers(doc)
 
-  return `<!doctype html>${doc.documentElement.outerHTML}`;
+  return `<!doctype html>${doc.documentElement.outerHTML}`
 }

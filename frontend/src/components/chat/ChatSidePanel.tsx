@@ -455,7 +455,18 @@ function BookRefNodeView(props: ReactNodeViewProps) {
   const handleNavigate = (e: React.MouseEvent) => {
     e.preventDefault()
     e.stopPropagation()
-    if (!canNavigate) return
+    if (!canNavigate) {
+      debugChatMentions('chip:navigate:blocked', {
+        bookId: attrs.bookId,
+        hasBookId,
+        href: attrs.href,
+        hasHref,
+        spineIndex: attrs.spineIndex,
+        startIndex: attrs.startIndex,
+        canNavigateByOffset,
+      })
+      return
+    }
     const onNavigate = (props.extension.options as any)?.onNavigate as
       | ((payload: BookRefNavigatePayload) => void)
       | null

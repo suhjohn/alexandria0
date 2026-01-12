@@ -15,6 +15,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
 	"github.com/google/uuid"
@@ -178,6 +179,81 @@ func (r *R2Client) Delete(ctx context.Context, key string) error {
 	return err
 }
 
+func (r *R2Client) DeletePrefix(ctx context.Context, prefix string) (int, error) {
+	p := strings.TrimSpace(prefix)
+	if p == "" {
+		return 0, errors.New("missing prefix")
+	}
+
+	deleted := 0
+	var token *string
+	for {
+		out, err := r.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket:            aws.String(r.bucket),
+			Prefix:            aws.String(p),
+			ContinuationToken: token,
+		})
+		if err != nil {
+			return deleted, err
+		}
+
+		objects := make([]types.ObjectIdentifier, 0, len(out.Contents))
+		for _, obj := range out.Contents {
+			if obj.Key == nil || strings.TrimSpace(*obj.Key) == "" {
+				continue
+			}
+			objects = append(objects, types.ObjectIdentifier{Key: obj.Key})
+		}
+
+		if len(objects) > 0 {
+			delOut, err := r.client.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+				Bucket: aws.String(r.bucket),
+				Delete: &types.Delete{
+					Objects: objects,
+					Quiet:   aws.Bool(true),
+				},
+			})
+			if err != nil {
+				return deleted, err
+			}
+			if len(delOut.Errors) > 0 {
+				first := delOut.Errors[0]
+				key := ""
+				if first.Key != nil {
+					key = *first.Key
+				}
+				code := ""
+				if first.Code != nil {
+					code = *first.Code
+				}
+				message := ""
+				if first.Message != nil {
+					message = *first.Message
+				}
+				if key == "" {
+					key = "<unknown>"
+				}
+				if code == "" {
+					code = "unknown"
+				}
+				if message == "" {
+					message = "unknown error"
+				}
+				return deleted, fmt.Errorf("failed to delete %q (%s): %s", key, code, message)
+			}
+			deleted += len(objects)
+		}
+
+		isTruncated := out.IsTruncated != nil && *out.IsTruncated
+		if !isTruncated || out.NextContinuationToken == nil || strings.TrimSpace(*out.NextContinuationToken) == "" {
+			break
+		}
+		token = out.NextContinuationToken
+	}
+
+	return deleted, nil
+}
+
 func (r *R2Client) Exists(ctx context.Context, key string) (bool, error) {
 	_, err := r.client.HeadObject(ctx, &s3.HeadObjectInput{
 		Bucket: aws.String(r.bucket),
@@ -238,6 +314,10 @@ func (r *R2Client) KeyFromPublicURL(url string) (string, bool) {
 
 func SourceEPUBKey(bookID uuid.UUID) string {
 	return path.Join("books", bookID.String(), "source.epub")
+}
+
+func BookCoverKey(bookID uuid.UUID) string {
+	return path.Join("books", bookID.String(), "cover")
 }
 
 func CoverPath(bookID int, ext string) string {
