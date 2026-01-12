@@ -397,6 +397,7 @@ function App() {
     bookId: string
     spineIndex?: number
     textOffset?: number
+    selectedText?: string
     href?: string
   } | null>(null)
   const readerRef = useRef<EpubReaderV2Handle | null>(null)
@@ -599,7 +600,12 @@ function App() {
 
   const handleNavigateBookRef = (
     payload:
-      | { bookId: string; spineIndex: number; textOffset: number }
+      | {
+          bookId: string
+          spineIndex: number
+          textOffset: number
+          selectedText?: string
+        }
       | { bookId: string; href: string },
   ) => {
     const stripVariantSuffix = (raw: string) => {
@@ -695,15 +701,34 @@ function App() {
     )
 
     updateSelectedBook(targetBookId)
+
+    if (typeof (payload as any).href === 'string') {
+      setPendingReaderNavigation({
+        id: createInsertId(),
+        bookId: canonicalBookId,
+        href: String((payload as any).href),
+      })
+      return
+    }
+
+    // Defensive: chips can be hydrated from storage with string attrs. Coerce
+    // here so the reader effect sees actual numbers (and doesn't ignore the
+    // navigation due to `Number.isFinite` failing).
+    const spineIndex = Number((payload as any).spineIndex)
+    const textOffset = Number((payload as any).textOffset)
+    if (!Number.isFinite(spineIndex) || !Number.isFinite(textOffset)) {
+      return
+    }
+
     setPendingReaderNavigation({
       id: createInsertId(),
       bookId: canonicalBookId,
-      ...(typeof (payload as any).href === 'string'
-        ? { href: (payload as any).href as string }
-        : {
-            spineIndex: (payload as any).spineIndex as number,
-            textOffset: (payload as any).textOffset as number,
-          }),
+      spineIndex: Math.max(0, Math.floor(spineIndex)),
+      textOffset: Math.max(0, Math.floor(textOffset)),
+      selectedText:
+        typeof (payload as any).selectedText === 'string'
+          ? ((payload as any).selectedText as string)
+          : undefined,
     })
   }
 

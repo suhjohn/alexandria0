@@ -129,6 +129,7 @@ export type EpubReaderV2Props = {
     bookId: string
     spineIndex?: number
     textOffset?: number
+    selectedText?: string
     href?: string
   } | null
   onConsumePendingNavigation?: (id: string) => void
@@ -150,6 +151,26 @@ function normalizeVisibleText(text: string): string {
     .replace(/\n{3,}/g, '\n\n')
     .replace(/[ \t]{2,}/g, ' ')
     .trim()
+}
+
+function normalizeSearchText(text: string): string {
+  return String(text ?? '')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+function elementLikelyContainsText(el: Element, expectedText: string): boolean {
+  const signature = normalizeSearchText(expectedText).slice(0, 80)
+  if (signature.length < 20) return true
+  const container =
+    el.closest?.(
+      'p,li,blockquote,pre,div,section,article,h1,h2,h3,h4,h5,h6,body',
+    ) ?? el
+  const haystack = normalizeSearchText(container.textContent ?? '')
+  if (!haystack) return false
+  // Use a shorter signature to reduce false negatives from minor whitespace differences.
+  const shortSig = signature.slice(0, 48)
+  return haystack.includes(shortSig)
 }
 
 type CaretPoint = { node: Text; offset: number }
@@ -1601,6 +1622,7 @@ const EpubReaderV2Inner = forwardRef<
     fragment?: string
     behavior?: ScrollBehavior
     textOffset?: number
+    selectedText?: string
     consumeNavigationId?: string
   } | null>(null)
   const pendingVariantRestoreRef = useRef<{
@@ -1991,6 +2013,7 @@ const EpubReaderV2Inner = forwardRef<
         fragment?: string
         behavior?: ScrollBehavior
         textOffset?: number
+        selectedText?: string
         consumeNavigationId?: string
       },
     ) => {
@@ -2214,7 +2237,11 @@ const EpubReaderV2Inner = forwardRef<
   )
 
   const goToTextOffsetInCurrentDoc = useCallback(
-    (textOffset: number, behavior?: ScrollBehavior) => {
+    (
+      textOffset: number,
+      behavior?: ScrollBehavior,
+      expectedText?: string,
+    ) => {
       const doc = iframeDocRef.current
       const layout = appliedLayoutRef.current
       if (!doc || !layout) return false
@@ -2224,6 +2251,9 @@ const EpubReaderV2Inner = forwardRef<
 
       const el = (pos.node.parentElement ?? doc.body) as Element | null
       if (!el) return false
+      if (expectedText && !elementLikelyContainsText(el, expectedText)) {
+        return false
+      }
 
       const href = publication?.spine[spineIndex]?.href ?? ''
 
@@ -2267,6 +2297,99 @@ const EpubReaderV2Inner = forwardRef<
       spineIndex,
       settings.flowMode,
       findTextPositionAtOffset,
+      setLocation,
+      setScrollLocation,
+    ],
+  )
+
+  const goToTextSearchInCurrentDoc = useCallback(
+    (selectedText: string, behavior?: ScrollBehavior) => {
+      const doc = iframeDocRef.current
+      const layout = appliedLayoutRef.current
+      if (!doc || !layout) return false
+      const win = doc.defaultView as any
+      if (!win || typeof win.find !== 'function') return false
+
+      const normalized = normalizeSearchText(selectedText)
+      if (!normalized) return false
+
+      const candidates = [
+        normalized,
+        normalized.slice(0, 180),
+        normalized.slice(0, 120),
+        normalized.slice(0, 80),
+        normalized.slice(0, 48),
+      ]
+        .map((s) => s.trim())
+        .filter((s, idx, arr) => s.length >= 20 && arr.indexOf(s) === idx)
+
+      for (const needle of candidates) {
+        try {
+          doc.defaultView?.getSelection?.()?.removeAllRanges?.()
+        } catch {
+          // ignore
+        }
+        const found = Boolean(win.find(needle))
+        if (!found) continue
+
+        const sel = doc.defaultView?.getSelection?.() ?? null
+        if (!sel || sel.rangeCount === 0) return true
+        let node: Node | null = null
+        try {
+          node = sel.getRangeAt(0).startContainer ?? null
+        } catch {
+          node = sel.anchorNode ?? null
+        }
+        const el =
+          node && node.nodeType === Node.ELEMENT_NODE
+            ? (node as Element)
+            : node?.parentElement ?? null
+        if (!el) return true
+
+        const href = publication?.spine[spineIndex]?.href ?? ''
+
+        if (settings.flowMode === 'scrolled') {
+          const viewportRect = layout.viewportEl.getBoundingClientRect()
+          const rect = (el as HTMLElement).getBoundingClientRect()
+          const targetTop =
+            rect.top - viewportRect.top + layout.viewportEl.scrollTop
+          layout.viewportEl.scrollTo({
+            left: 0,
+            top: Math.max(0, targetTop),
+            behavior: behavior ?? 'auto',
+          })
+          setScrollLocation({
+            spineIndex,
+            scrollTop: layout.viewportEl.scrollTop,
+            href,
+          })
+          return true
+        }
+
+        const chapterPageIndex = findPageIndexForElement({
+          layout,
+          element: el,
+        })
+        scrollToPage({
+          layout,
+          pageIndex: chapterPageIndex,
+          behavior: behavior ?? 'auto',
+        })
+        setLocation({
+          spineIndex,
+          pageIndex: chapterPageIndex,
+          chapterTotalPages: layout.totalPages,
+          href,
+        })
+        return true
+      }
+
+      return false
+    },
+    [
+      publication,
+      spineIndex,
+      settings.flowMode,
       setLocation,
       setScrollLocation,
     ],
@@ -2704,10 +2827,16 @@ const EpubReaderV2Inner = forwardRef<
         typeof effectivePending?.textOffset === 'number' &&
         Number.isFinite(effectivePending.textOffset)
       ) {
-        const ok = goToTextOffsetInCurrentDoc(
-          effectivePending.textOffset,
-          effectivePending.behavior,
-        )
+        const expectedText = String(effectivePending.selectedText ?? '').trim()
+        const ok =
+          goToTextOffsetInCurrentDoc(
+            effectivePending.textOffset,
+            effectivePending.behavior,
+            expectedText,
+          ) ||
+          (expectedText
+            ? goToTextSearchInCurrentDoc(expectedText, effectivePending.behavior)
+            : false)
         if (ok) {
           if (effectivePending.consumeNavigationId) {
             onConsumePendingNavigationRef.current?.(
@@ -2847,6 +2976,7 @@ const EpubReaderV2Inner = forwardRef<
     spineIndex,
     goToAnchorInCurrentDoc,
     goToTextOffsetInCurrentDoc,
+    goToTextSearchInCurrentDoc,
     setLocation,
     setScrollLocation,
   ])
@@ -3144,17 +3274,50 @@ const EpubReaderV2Inner = forwardRef<
             ? (endNode as Element)
             : endNode.parentElement) ?? null
 
+        // Compute offsets using raw text-node lengths (not Range.toString()),
+        // so they can be reliably resolved later via TreeWalker.
         const body = doc.body
         if (body) {
-          const beforeStart = doc.createRange()
-          beforeStart.setStart(body, 0)
-          beforeStart.setEnd(range.startContainer, range.startOffset)
-          rawStartIndex = beforeStart.toString().length
+          const pointToOffset = (container: Node, offset: number) => {
+            const boundary = doc.createRange()
+            try {
+              boundary.setStart(container, offset)
+              boundary.collapse(true)
+            } catch {
+              return 0
+            }
 
-          const beforeEnd = doc.createRange()
-          beforeEnd.setStart(body, 0)
-          beforeEnd.setEnd(range.endContainer, range.endOffset)
-          rawEndIndex = beforeEnd.toString().length
+            const walker = doc.createTreeWalker(body, NodeFilter.SHOW_TEXT)
+            let total = 0
+            while (walker.nextNode()) {
+              const node = walker.currentNode as Text
+              const len = node.nodeValue?.length ?? 0
+              if (len <= 0) continue
+
+              if (node === container && container.nodeType === Node.TEXT_NODE) {
+                return total + clamp(Number(offset) || 0, 0, len)
+              }
+
+              try {
+                const startCmp = boundary.comparePoint(node, 0)
+                if (startCmp === 1) break
+                const endCmp = boundary.comparePoint(node, len)
+                if (endCmp === -1 || endCmp === 0) {
+                  total += len
+                  continue
+                }
+                // Boundary is within this node (should be rare unless container is this text node).
+                break
+              } catch {
+                // If comparison fails, fall back to accumulating and continue.
+                total += len
+              }
+            }
+            return total
+          }
+
+          rawStartIndex = pointToOffset(range.startContainer, range.startOffset)
+          rawEndIndex = pointToOffset(range.endContainer, range.endOffset)
         }
       } catch {
         // ignore
@@ -3621,6 +3784,7 @@ const EpubReaderV2Inner = forwardRef<
     if (!Number.isFinite(textOffset)) {
       return
     }
+    const selectedText = String(pendingNavigation.selectedText ?? '').trim()
 
     const targetSpineIndex = pendingNavigation.spineIndex ?? spineIndex
     if (targetSpineIndex !== spineIndex) {
@@ -3628,12 +3792,17 @@ const EpubReaderV2Inner = forwardRef<
         pageIndex: 0,
         behavior: 'auto',
         textOffset,
+        selectedText,
         consumeNavigationId: pendingNavigation.id,
       })
       return
     }
 
-    const ok = goToTextOffsetInCurrentDoc(textOffset, 'auto')
+    const ok =
+      goToTextOffsetInCurrentDoc(textOffset, 'auto', selectedText) ||
+      (selectedText
+        ? goToTextSearchInCurrentDoc(selectedText, 'auto')
+        : false)
     if (ok) {
       onConsumePendingNavigationRef.current?.(pendingNavigation.id)
       return
@@ -3641,6 +3810,7 @@ const EpubReaderV2Inner = forwardRef<
 
     pendingNavRef.current = {
       textOffset,
+      selectedText,
       behavior: 'auto',
       consumeNavigationId: pendingNavigation.id,
     }
@@ -3650,12 +3820,14 @@ const EpubReaderV2Inner = forwardRef<
     pendingNavigation?.bookId,
     pendingNavigation?.spineIndex,
     pendingNavigation?.textOffset,
+    pendingNavigation?.selectedText,
     pendingNavigation?.href,
     publication,
     baseStorageId,
     spineIndex,
     loadSpine,
     goToTextOffsetInCurrentDoc,
+    goToTextSearchInCurrentDoc,
     switchVariant,
   ])
 

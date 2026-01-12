@@ -117,7 +117,12 @@ type ChatImageAttrs = {
 }
 
 type BookRefNavigatePayload =
-  | { bookId: string; spineIndex: number; textOffset: number }
+  | {
+      bookId: string
+      spineIndex: number
+      textOffset: number
+      selectedText?: string
+    }
   | { bookId: string; href: string }
 
 type ChapterSuggestion = EpubReaderV2ChapterSuggestion
@@ -424,11 +429,13 @@ function BookRefNodeView(props: ReactNodeViewProps) {
 
   const hasBookId = typeof attrs.bookId === 'string' && attrs.bookId.length > 0
   const hasHref = typeof attrs.href === 'string' && attrs.href.length > 0
+  // Stored attrs can come back as strings depending on how the chat message was
+  // serialized (HTML vs JSON). Coerce before checking so we don't accidentally
+  // fall back to href navigation (which typically lands at the chapter start).
+  const spineIndexNum = Number((attrs as any).spineIndex)
+  const startIndexNum = Number((attrs as any).startIndex)
   const canNavigateByOffset =
-    typeof attrs.spineIndex === 'number' &&
-    Number.isFinite(attrs.spineIndex) &&
-    typeof attrs.startIndex === 'number' &&
-    Number.isFinite(attrs.startIndex)
+    Number.isFinite(spineIndexNum) && Number.isFinite(startIndexNum)
   const canNavigate = hasBookId && (hasHref || canNavigateByOffset)
   const canCopy = Boolean(selectedText.trim())
 
@@ -454,8 +461,10 @@ function BookRefNodeView(props: ReactNodeViewProps) {
       | null
     const bookId = String(attrs.bookId ?? '')
     const href = String(attrs.href ?? '')
-    const spineIndex = Number(attrs.spineIndex)
-    const textOffset = Number(attrs.startIndex ?? 0)
+    const spineIndex = spineIndexNum
+    const textOffset = startIndexNum
+    const selectedTextForNav =
+      selectedText.length > 2000 ? selectedText.slice(0, 2000) : selectedText
 
     // Prefer href navigation when we have an explicit fragment; otherwise we'd
     // drop the anchor and jump to the start of the spine item.
@@ -473,7 +482,12 @@ function BookRefNodeView(props: ReactNodeViewProps) {
         spineIndex,
         textOffset,
       })
-      onNavigate?.({ bookId, spineIndex, textOffset })
+      onNavigate?.({
+        bookId,
+        spineIndex,
+        textOffset,
+        selectedText: selectedTextForNav,
+      })
       return
     }
     if (hasHref) {
