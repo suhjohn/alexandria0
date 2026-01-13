@@ -25,6 +25,19 @@ This project uses [Vitest](https://vitest.dev/) for testing. You can run the tes
 pnpm test
 ```
 
+### E2E (Playwright)
+
+E2E tests live in `frontend/e2e/` and use Playwright.
+
+```bash
+# E2E runs against a production build (`pnpm build` + `pnpm preview`)
+pnpm test:e2e
+```
+
+Some E2E tests require `GEMINI_API_KEY` (read from `frontend/.env.playwright`).
+
+Note: the frontend toolchain (Vite) requires a recent Node.js (see Vite's printed requirement if you hit startup/build errors).
+
 ## Styling
 
 This project uses [Tailwind CSS](https://tailwindcss.com/) for styling.

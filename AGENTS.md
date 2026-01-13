@@ -663,3 +663,7 @@ Code that runs because a component was displayed should be in Effects, the rest 
 If you need to update the state of several components, it’s better to do it during a single event.
 Whenever you try to synchronize state variables in different components, consider lifting state up.
 You can fetch data with Effects, but you need to implement cleanup to avoid race conditions.
+
+---
+
+We use nvm for node environment on frontend. do `nvm use 24` to setup the right version to do pnpm commands.

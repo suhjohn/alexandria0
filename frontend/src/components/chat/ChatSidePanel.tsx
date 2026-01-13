@@ -949,7 +949,11 @@ function ChatComposer(props: {
       `}</style>
       <div className="max-h-28 overflow-y-auto">
         {editor ? (
-          <EditorContent editor={editor} className="mfv2-chatComposer" />
+          <EditorContent
+            editor={editor}
+            className="mfv2-chatComposer"
+            data-testid="chat-composer"
+          />
         ) : (
           <div className="h-7" />
         )}
@@ -2289,7 +2293,7 @@ export function ChatSidePanel(
           onScroll={handleScroll}
           className="flex-1 h-full overflow-y-auto flex flex-col bg-[color:var(--paper-deep)]"
         >
-          <div className="flex-1 px-3 py-3">
+          <div className="flex-1 px-3 py-3" data-testid="chat-message-list">
             {messages.length === 0 ? (
               <div className="h-full flex items-center justify-center">
                 <div className="text-center">
@@ -2344,6 +2348,8 @@ export function ChatSidePanel(
                   return (
                     <div
                       key={m.id}
+                      data-testid="chat-message"
+                      data-chat-role={m.role}
                       className={cn('group flex flex-col', isUser && 'gap-2')}
                     >
                       <div
