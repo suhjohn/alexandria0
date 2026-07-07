@@ -1,0 +1,200 @@
+.pdfreader-root {
+  background:
+    radial-gradient(circle at top left, rgba(255, 255, 255, 0.72), transparent 28rem),
+    linear-gradient(180deg, rgba(250, 250, 249, 0.98), rgba(231, 229, 228, 0.98));
+}
+
+.pdfreader-theme-dark {
+  background:
+    radial-gradient(circle at top left, rgba(82, 82, 91, 0.28), transparent 28rem),
+    linear-gradient(180deg, #18181b, #09090b);
+}
+
+.pdfreader-theme-sepia {
+  background:
+    radial-gradient(circle at top left, rgba(255, 251, 235, 0.78), transparent 28rem),
+    linear-gradient(180deg, #efe6d5, #ddd1bc);
+}
+
+.pdfreader-viewport {
+  padding: 28px 28px 18px;
+}
+
+.pdfreader-page {
+  border-radius: 2px;
+  overflow: hidden;
+  box-shadow:
+    0 1px 2px rgba(15, 23, 42, 0.14),
+    0 18px 42px rgba(15, 23, 42, 0.2);
+}
+
+.pdfreader-theme-dark .pdfreader-page {
+  box-shadow:
+    0 1px 2px rgba(0, 0, 0, 0.45),
+    0 22px 56px rgba(0, 0, 0, 0.48);
+}
+
+.pdfreader-toolbar {
+  display: flex;
+  min-height: 56px;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  border-top: 1px solid rgba(120, 113, 108, 0.24);
+  background: rgba(255, 255, 255, 0.78);
+  color: #1c1917;
+  box-shadow: 0 -10px 30px rgba(15, 23, 42, 0.08);
+  backdrop-filter: blur(14px);
+}
+
+.pdfreader-theme-dark .pdfreader-toolbar {
+  border-color: rgba(255, 255, 255, 0.12);
+  background: rgba(24, 24, 27, 0.82);
+  color: #f4f4f5;
+  box-shadow: 0 -12px 34px rgba(0, 0, 0, 0.26);
+}
+
+.pdfreader-theme-sepia .pdfreader-toolbar {
+  border-color: rgba(120, 83, 52, 0.22);
+  background: rgba(250, 244, 232, 0.8);
+  color: #292524;
+}
+
+.pdfreader-toolbarGroup {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border: 1px solid rgba(120, 113, 108, 0.26);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.58);
+  padding: 3px;
+}
+
+.pdfreader-theme-dark .pdfreader-toolbarGroup {
+  border-color: rgba(255, 255, 255, 0.14);
+  background: rgba(39, 39, 42, 0.72);
+}
+
+.pdfreader-iconButton {
+  display: inline-flex;
+  width: 34px;
+  height: 34px;
+  align-items: center;
+  justify-content: center;
+  border-radius: 6px;
+  color: currentColor;
+  transition:
+    background-color 120ms ease,
+    color 120ms ease,
+    opacity 120ms ease;
+}
+
+.pdfreader-iconButton:hover:not(:disabled),
+.pdfreader-iconButtonActive {
+  background: rgba(37, 99, 235, 0.12);
+  color: #1d4ed8;
+}
+
+.pdfreader-theme-dark .pdfreader-iconButton:hover:not(:disabled),
+.pdfreader-theme-dark .pdfreader-iconButtonActive {
+  background: rgba(96, 165, 250, 0.18);
+  color: #93c5fd;
+}
+
+.pdfreader-iconButton:disabled {
+  cursor: default;
+  opacity: 0.34;
+}
+
+.pdfreader-pageControl {
+  display: inline-flex;
+  height: 34px;
+  align-items: center;
+  gap: 6px;
+  padding: 0 8px;
+  color: inherit;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.pdfreader-pageInput {
+  width: 44px;
+  height: 26px;
+  border: 1px solid rgba(120, 113, 108, 0.28);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.76);
+  padding: 0 6px;
+  text-align: right;
+  outline: none;
+}
+
+.pdfreader-pageInput:focus {
+  border-color: rgba(37, 99, 235, 0.7);
+  box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.14);
+}
+
+.pdfreader-theme-dark .pdfreader-pageInput {
+  border-color: rgba(255, 255, 255, 0.16);
+  background: rgba(9, 9, 11, 0.45);
+  color: #f4f4f5;
+}
+
+.pdfreader-pageTotal {
+  color: color-mix(in srgb, currentColor 64%, transparent);
+}
+
+.pdfreader-addSelectionButton {
+  height: 36px;
+  border: 1px solid rgba(37, 99, 235, 0.24);
+  border-radius: 8px;
+  background: rgba(37, 99, 235, 0.1);
+  padding: 0 12px;
+  color: #1d4ed8;
+  font-size: 12px;
+  transition: background-color 120ms ease;
+}
+
+.pdfreader-addSelectionButton:hover {
+  background: rgba(37, 99, 235, 0.16);
+}
+
+.pdfreader-theme-dark .pdfreader-addSelectionButton {
+  border-color: rgba(96, 165, 250, 0.28);
+  background: rgba(96, 165, 250, 0.14);
+  color: #bfdbfe;
+}
+
+.pdfreader-text-layer {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  opacity: 1;
+  line-height: 1;
+  text-align: initial;
+  text-size-adjust: none;
+  forced-color-adjust: none;
+  transform-origin: 0 0;
+  z-index: 2;
+}
+
+.pdfreader-text-layer :is(span, br) {
+  color: transparent;
+  position: absolute;
+  white-space: pre;
+  cursor: text;
+  transform-origin: 0% 0%;
+}
+
+.pdfreader-text-layer ::selection {
+  background: color-mix(in srgb, #2563eb 36%, transparent);
+}
+
+.pdfreader-region-rect {
+  position: absolute;
+  z-index: 5;
+  pointer-events: none;
+  border: 2px solid #2563eb;
+  background: color-mix(in srgb, #2563eb 18%, transparent);
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.75);
+}

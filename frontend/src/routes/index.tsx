@@ -45,6 +45,8 @@ import type { EpubReaderV2ThemePreset } from '@/components/epubreader_v2/types'
 import { THEME_PRESETS } from '@/components/epubreader_v2/types'
 import { apiBaseUrl, getMe, logout } from '@/data/auth'
 import { EpubReaderV2 } from '@/components/epubreader_v2'
+import { PdfReader, type PdfSelectionPayload } from '@/components/pdfreader'
+import type { ReaderHandle } from '@/components/reader-shared/types'
 import { ResizableWindow } from '@/components/ui/resizable-window'
 import { ChatSidePanel } from '@/components/chat/ChatSidePanel'
 import { getChatDb } from '@/lib/chat-db'
@@ -113,9 +115,9 @@ const READER_PENDING_TRANSLATE_STORAGE_PREFIX =
 
 /** Supported file formats for book uploads */
 const SUPPORTED_UPLOAD_FORMATS = {
-  extensions: ['.epub'],
-  mimeTypes: ['application/epub+zip'],
-  accept: '.epub,application/epub+zip',
+  extensions: ['.epub', '.pdf'],
+  mimeTypes: ['application/epub+zip', 'application/pdf'],
+  accept: '.epub,.pdf,application/epub+zip,application/pdf',
 } as const
 
 function isValidUploadFile(file: File): boolean {
@@ -127,6 +129,52 @@ function isValidUploadFile(file: File): boolean {
     file.type as (typeof SUPPORTED_UPLOAD_FORMATS.mimeTypes)[number],
   )
   return hasValidExtension || hasValidMimeType
+}
+
+function getBookFormat(book: Pick<Book, 'format'> | null | undefined) {
+  return book?.format === 'pdf' ? 'pdf' : 'epub'
+}
+
+function loadStoredPdfPage(bookId: string): number {
+  try {
+    if (typeof window === 'undefined' || typeof localStorage === 'undefined')
+      return 0
+    const raw = localStorage.getItem(
+      `${READER_LOCATION_STORAGE_PREFIX}${bookId}`,
+    )
+    if (!raw) return 0
+    const parsed = JSON.parse(raw)
+    const pageIndex = Number(parsed?.pageIndex ?? 0)
+    return Number.isFinite(pageIndex) ? Math.max(0, Math.floor(pageIndex)) : 0
+  } catch {
+    return 0
+  }
+}
+
+function storePdfPage(bookId: string, pageIndex: number) {
+  try {
+    if (typeof window === 'undefined' || typeof localStorage === 'undefined')
+      return
+    localStorage.setItem(
+      `${READER_LOCATION_STORAGE_PREFIX}${bookId}`,
+      JSON.stringify({ pageIndex: Math.max(0, Math.floor(pageIndex)) }),
+    )
+  } catch {
+    // ignore
+  }
+}
+
+function parseImageDataUrl(dataUrl: string) {
+  const match = /^data:([^;]+);base64,(.+)$/i.exec(String(dataUrl ?? '').trim())
+  if (!match) return null
+  const mediaType = match[1] ?? ''
+  const dataBase64 = match[2] ?? ''
+  if (!mediaType || !dataBase64) return null
+  return {
+    mediaType,
+    dataBase64,
+    sizeBytes: Math.ceil((dataBase64.length * 3) / 4),
+  }
 }
 
 function BookThumbnail(props: { src: string; alt: string }) {
@@ -190,11 +238,17 @@ function clearPersonalBookClientState(bookId: string) {
   try {
     localStorage.removeItem(`${READER_LOCATION_STORAGE_PREFIX}${baseId}`)
     localStorage.removeItem(`${READER_VARIANT_STORAGE_PREFIX}${baseId}`)
-    localStorage.removeItem(`${READER_PENDING_TRANSLATE_STORAGE_PREFIX}${baseId}`)
+    localStorage.removeItem(
+      `${READER_PENDING_TRANSLATE_STORAGE_PREFIX}${baseId}`,
+    )
 
     // Legacy keys: location persisted per-variant.
-    localStorage.removeItem(`${READER_LOCATION_STORAGE_PREFIX}${baseId}@original`)
-    localStorage.removeItem(`${READER_LOCATION_STORAGE_PREFIX}${baseId}@modernify`)
+    localStorage.removeItem(
+      `${READER_LOCATION_STORAGE_PREFIX}${baseId}@original`,
+    )
+    localStorage.removeItem(
+      `${READER_LOCATION_STORAGE_PREFIX}${baseId}@modernify`,
+    )
     for (const variant of pendingTranslateVariants) {
       localStorage.removeItem(
         `${READER_LOCATION_STORAGE_PREFIX}${baseId}@${variant}`,
@@ -455,6 +509,26 @@ function App() {
     queryKey: ['books', 'search', libraryScope, libraryQuery],
     limit: libraryLimit,
     enabled: libraryScope === 'public' || Boolean(me),
+    refetchInterval:
+      libraryScope === 'personal'
+        ? (query) => {
+            const pages =
+              (
+                query as {
+                  state?: { data?: { pages?: Array<{ items?: Book[] }> } }
+                }
+              ).state?.data?.pages ?? []
+            return pages.some((page) =>
+              (page.items ?? []).some(
+                (book) =>
+                  getBookFormat(book) === 'pdf' &&
+                  book.pdf_has_text_layer === null,
+              ),
+            )
+              ? 10_000
+              : false
+          }
+        : false,
     queryFn: ({ cursor, limit }) =>
       searchBooks({ query: libraryQuery, cursor, limit, scope: libraryScope }),
   })
@@ -526,7 +600,17 @@ function App() {
       enabled: Boolean(selectedBookId),
       queryFn: async () => (selectedBookId ? getBook(selectedBookId) : null),
     })
+  const selectedBookFormat = getBookFormat(selectedBook)
+  const selectedBookIsPdf = selectedBookFormat === 'pdf'
+  const activeReaderIsPdf = selectedBookIsPdf
   const [readerStatus, setReaderStatus] = useState<EpubReaderV2Status>('idle')
+  const [pdfLocation, setPdfLocation] = useState<{
+    pageIndex: number
+    pageLabel: string
+    pageCount: number
+    visiblePageIndices: number[]
+    visiblePageLabels: string[]
+  } | null>(null)
 
   const [isPanelVisible, setIsPanelVisible] = useState<boolean>(() => {
     if (typeof initialPanelVisible === 'boolean') {
@@ -571,6 +655,31 @@ function App() {
     selectedText: string
   }
 
+  type ChatPendingInsert =
+    | {
+        id: string
+        kind: 'bookRef'
+        target?: 'current' | 'lastSelected' | 'newConversation'
+        bookId: string
+        bookTitle: string
+        startPage: number
+        startIndex: number
+        endPage: number
+        endIndex: number
+        selectedText: string
+        spineIndex: number
+      }
+    | {
+        id: string
+        kind: 'chatImage'
+        target?: 'current' | 'lastSelected' | 'newConversation'
+        filename: string
+        mediaType: string
+        dataBase64: string
+        sizeBytes?: number | null
+        prefixText?: string
+      }
+
   const [readerSelectionToken, setReaderSelectionToken] =
     useState<ReaderSelectionToken | null>(null)
   const [readerTocToken, setReaderTocToken] = useState<{
@@ -584,19 +693,8 @@ function App() {
       depth: number
     }>
   } | null>(null)
-  const [chatPendingInsert, setChatPendingInsert] = useState<{
-    id: string
-    kind: 'bookRef'
-    target?: 'current' | 'lastSelected' | 'newConversation'
-    bookId: string
-    bookTitle: string
-    startPage: number
-    startIndex: number
-    endPage: number
-    endIndex: number
-    selectedText: string
-    spineIndex: number
-  } | null>(null)
+  const [chatPendingInsert, setChatPendingInsert] =
+    useState<ChatPendingInsert | null>(null)
   const [chatPendingConversationAction, setChatPendingConversationAction] =
     useState<{
       id: string
@@ -616,7 +714,7 @@ function App() {
     selectedText?: string
     href?: string
   } | null>(null)
-  const readerRef = useRef<EpubReaderV2Handle | null>(null)
+  const readerRef = useRef<ReaderHandle | EpubReaderV2Handle | null>(null)
   const getCurrentReaderPage = useCallback(
     () => readerRef.current?.getVisiblePage?.() ?? null,
     [],
@@ -663,6 +761,81 @@ function App() {
       readerRef.current?.getSpineItemParts(options) ?? Promise.resolve(null),
     [],
   )
+  const getPageRangeParts = useCallback(
+    (options: {
+      startPage: number
+      endPage: number
+      maxChars?: number
+      maxImages?: number
+      maxImageBytes?: number
+    }) =>
+      activeReaderIsPdf
+        ? ((readerRef.current as ReaderHandle | null)?.getPageRangeParts(
+            options,
+          ) ?? Promise.resolve(null))
+        : Promise.resolve(null),
+    [activeReaderIsPdf],
+  )
+  const pdfTextLayerPollingStartedAtRef = useRef<Record<string, number>>({})
+
+  useEffect(() => {
+    setPdfLocation(null)
+  }, [selectedBookId, selectedBookFormat])
+
+  useEffect(() => {
+    if (
+      !selectedBookId ||
+      !selectedBook ||
+      getBookFormat(selectedBook) !== 'pdf' ||
+      selectedBook.pdf_has_text_layer !== null
+    ) {
+      return
+    }
+
+    let cancelled = false
+    const startedAt =
+      pdfTextLayerPollingStartedAtRef.current[selectedBookId] ?? Date.now()
+    pdfTextLayerPollingStartedAtRef.current[selectedBookId] = startedAt
+    const poll = async () => {
+      try {
+        const next = await getBook(selectedBookId)
+        if (cancelled || !next) return
+        queryClient.setQueryData(['book', selectedBookId], next)
+        if (next.pdf_has_text_layer !== null) {
+          delete pdfTextLayerPollingStartedAtRef.current[selectedBookId]
+          cancelled = true
+        }
+      } catch {
+        // keep polling until the timeout
+      }
+    }
+
+    const interval = window.setInterval(() => {
+      if (cancelled || Date.now() - startedAt >= 120_000) {
+        window.clearInterval(interval)
+        return
+      }
+      void poll()
+    }, 5_000)
+
+    return () => {
+      cancelled = true
+      window.clearInterval(interval)
+    }
+  }, [queryClient, selectedBook, selectedBookId])
+
+  useEffect(() => {
+    if (!selectedBook || !activeReaderIsPdf || !pendingReaderNavigation) return
+    const targetBookId = pendingReaderNavigation.bookId.split('@')[0]
+    if (targetBookId !== selectedBook.id) return
+    if (!pendingReaderNavigation.href) return
+    const reader = readerRef.current
+    if (!reader || readerStatus !== 'ready') return
+    reader.goToHref(pendingReaderNavigation.href)
+    setPendingReaderNavigation((prev) =>
+      prev?.id === pendingReaderNavigation.id ? null : prev,
+    )
+  }, [activeReaderIsPdf, pendingReaderNavigation, readerStatus, selectedBook])
 
   const createInsertId = () => {
     if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) {
@@ -756,6 +929,52 @@ function App() {
       spineIndex: selection.spineIndex,
     })
     setReaderSelectionToken(null)
+  }
+
+  const toReaderSelectionToken = (
+    selection: PdfSelectionPayload,
+  ): ReaderSelectionToken => ({
+    bookId: selection.bookId,
+    bookTitle: selection.bookTitle,
+    spineIndex: selection.startPage,
+    startPage: selection.startPage,
+    startIndex: 0,
+    endPage: selection.endPage,
+    endIndex: selection.selectedText.length,
+    selectedText: selection.selectedText,
+  })
+
+  const insertPdfSelectionToChat = (
+    selection: PdfSelectionPayload,
+    target: 'current' | 'newConversation',
+  ) => {
+    if (selection.imageDataUrl) {
+      const image = parseImageDataUrl(selection.imageDataUrl)
+      if (!image) return
+      const labelIndex =
+        pdfLocation?.visiblePageIndices.findIndex(
+          (idx) => idx === selection.startPage,
+        ) ?? -1
+      const pageLabel =
+        labelIndex >= 0
+          ? pdfLocation?.visiblePageLabels[labelIndex]
+          : String(selection.startPage + 1)
+      const nextInsertId = createInsertId()
+      setChatPanelVisible(true)
+      setChatPendingInsert({
+        id: nextInsertId,
+        kind: 'chatImage',
+        target,
+        filename: `${selection.bookTitle || 'PDF'} p.${pageLabel}.png`,
+        mediaType: image.mediaType,
+        dataBase64: image.dataBase64,
+        sizeBytes: image.sizeBytes,
+        prefixText: `(p.${pageLabel}) `,
+      })
+      setReaderSelectionToken(null)
+      return
+    }
+    insertSelectionToChat(toReaderSelectionToken(selection), target)
   }
 
   const handleModI = () => {
@@ -928,16 +1147,34 @@ function App() {
     })
 
     updateSelectedBook(targetBookId)
+    const targetBook =
+      selectedBook?.id === targetBookId
+        ? selectedBook
+        : books.find((book) => book.id === targetBookId)
+    const targetIsPdf = Boolean(targetBook && getBookFormat(targetBook) === 'pdf')
+    const pendingBookId = targetIsPdf ? targetBookId : canonicalBookId
 
     if (typeof (payload as any).href === 'string') {
       debugBookRefNav('navigateBookRef:pending:set', {
-        bookId: canonicalBookId,
+        bookId: pendingBookId,
         href: String((payload as any).href),
       })
       setPendingReaderNavigation({
         id: createInsertId(),
-        bookId: canonicalBookId,
+        bookId: pendingBookId,
         href: String((payload as any).href),
+      })
+      return
+    }
+
+    if (targetIsPdf) {
+      const pageIndex = Number((payload as any).spineIndex)
+      if (!Number.isFinite(pageIndex)) return
+      if (selectedBook?.id !== targetBookId) setReaderStatus('idle')
+      setPendingReaderNavigation({
+        id: createInsertId(),
+        bookId: pendingBookId,
+        href: `page:${Math.max(0, Math.floor(pageIndex))}`,
       })
       return
     }
@@ -1198,7 +1435,7 @@ function App() {
           </div>
         </div>
         <TooltipProvider delayDuration={250}>
-          <div className="flex items-center">
+          <div className="flex items-center gap-2">
             <Tooltip>
               <TooltipTrigger asChild>
                 <button
@@ -1376,167 +1613,288 @@ function App() {
                       </button>
                     </div>
 
-                    <div className="mt-3">
-                      <div className="text-[10px] uppercase tracking-wider text-[color:var(--ink)]/60">
-                        Theme
-                      </div>
-                      <div className="mt-2 grid grid-cols-3 gap-2">
-                        {(
-                          Object.keys(
-                            THEME_PRESETS,
-                          ) as Array<EpubReaderV2ThemePreset>
-                        ).map((preset) => {
-                          const config = THEME_PRESETS[preset]
-                          const active = readerSettings.themePreset === preset
-                          return (
-                            <button
-                              key={preset}
-                              type="button"
-                              className={[
-                                'relative rounded-lg border p-2 text-left transition-colors',
-                                active
-                                  ? 'border-[color:var(--accent)]'
-                                  : 'border-[color:var(--accent-soft)] hover:border-[color:var(--accent)]',
-                              ].join(' ')}
-                              style={{
-                                background: config.bg,
-                                color: config.fg,
-                              }}
-                              onClick={() => {
-                                updateReaderSettings({
-                                  themePreset: preset,
-                                  theme: config.theme,
-                                  fontFamily: config.fontFamily,
-                                })
-                              }}
-                              aria-pressed={active}
-                            >
-                              <div
-                                className="text-sm leading-none"
-                                style={{ fontWeight: config.fontWeight }}
-                              >
-                                Aa
-                              </div>
-                              <div className="mt-1 text-[10px] opacity-70">
-                                {config.name}
-                              </div>
-                              {active && (
-                                <Check className="absolute right-2 top-2 h-3.5 w-3.5 opacity-80" />
-                              )}
-                            </button>
-                          )
-                        })}
-                      </div>
-                    </div>
-
-                    <div className="mt-4">
-                      <div className="text-[10px] uppercase tracking-wider text-[color:var(--ink)]/60">
-                        Text
-                      </div>
-
-                      <div className="mt-2 grid grid-cols-2 gap-2">
-                        <div className="col-span-2">
-                          <label className="block text-xs text-[color:var(--ink)]/70">
-                            Font
-                          </label>
-                          <select
-                            className="mt-1 w-full rounded-md border border-[color:var(--accent-soft)] bg-[color:var(--paper)] px-2 py-1 text-sm"
-                            value={readerSettings.fontFamily}
-                            onChange={(e) => {
-                              const value = e.target
-                                .value as typeof readerSettings.fontFamily
-                              updateReaderSettings({ fontFamily: value })
-                            }}
-                          >
-                            <option value="publisher">Publisher</option>
-                            <option value="serif">Serif</option>
-                            <option value="sans">Sans</option>
-                          </select>
-                        </div>
-
-                        <div className="col-span-2">
-                          <label className="block text-xs text-[color:var(--ink)]/70">
-                            Font size
-                          </label>
-                          <div className="mt-1 flex items-center gap-2">
-                            <button
-                              type="button"
-                              className="rounded-md border border-[color:var(--accent-soft)] px-2 py-1 text-sm hover:bg-[color:var(--paper-deep)] transition-colors"
-                              onClick={() => {
-                                const next = Math.max(
-                                  0.7,
-                                  readerSettings.fontScale - 0.05,
-                                )
-                                updateReaderSettings({ fontScale: next })
-                              }}
-                            >
-                              A-
-                            </button>
-                            <div className="flex-1">
-                              <input
-                                className="w-full"
-                                type="range"
-                                min="0.7"
-                                max="1.5"
-                                step="0.05"
-                                value={readerSettings.fontScale}
-                                onChange={(e) =>
-                                  updateReaderSettings({
-                                    fontScale: Number(e.target.value),
-                                  })
-                                }
-                              />
-                            </div>
-                            <button
-                              type="button"
-                              className="rounded-md border border-[color:var(--accent-soft)] px-2 py-1 text-sm hover:bg-[color:var(--paper-deep)] transition-colors"
-                              onClick={() => {
-                                const next = Math.min(
-                                  1.5,
-                                  readerSettings.fontScale + 0.05,
-                                )
-                                updateReaderSettings({ fontScale: next })
-                              }}
-                            >
-                              A+
-                            </button>
+                    {selectedBookIsPdf ? (
+                      <div className="mt-3 space-y-4">
+                        <div>
+                          <div className="text-[10px] uppercase tracking-wider text-[color:var(--ink)]/60">
+                            Spread
+                          </div>
+                          <div className="mt-2 grid grid-cols-3 rounded-md border border-[color:var(--accent-soft)] p-0.5">
+                            {(['auto', 'single', 'double'] as const).map(
+                              (spread) => (
+                                <button
+                                  key={spread}
+                                  type="button"
+                                  className={[
+                                    'rounded px-2 py-1 text-xs capitalize transition-colors',
+                                    readerSettings.pdf.spread === spread
+                                      ? 'bg-[color:var(--paper-deep)] text-[color:var(--ink)]'
+                                      : 'text-[color:var(--ink)]/70 hover:text-[color:var(--ink)]',
+                                  ].join(' ')}
+                                  onClick={() =>
+                                    updateReaderSettings({
+                                      pdf: { spread },
+                                    })
+                                  }
+                                  aria-pressed={
+                                    readerSettings.pdf.spread === spread
+                                  }
+                                >
+                                  {spread}
+                                </button>
+                              ),
+                            )}
                           </div>
                         </div>
 
-                        <div className="col-span-2">
-                          <label className="block text-xs text-[color:var(--ink)]/70">
-                            Line height
-                          </label>
-                          <div className="mt-1 flex items-center gap-2">
+                        <div>
+                          <div className="text-[10px] uppercase tracking-wider text-[color:var(--ink)]/60">
+                            Fit
+                          </div>
+                          <div className="mt-2 grid grid-cols-2 rounded-md border border-[color:var(--accent-soft)] p-0.5">
+                            {(['page', 'width'] as const).map((fit) => (
+                              <button
+                                key={fit}
+                                type="button"
+                                className={[
+                                  'rounded px-2 py-1 text-xs capitalize transition-colors',
+                                  readerSettings.pdf.fit === fit
+                                    ? 'bg-[color:var(--paper-deep)] text-[color:var(--ink)]'
+                                    : 'text-[color:var(--ink)]/70 hover:text-[color:var(--ink)]',
+                                ].join(' ')}
+                                onClick={() =>
+                                  updateReaderSettings({ pdf: { fit } })
+                                }
+                                aria-pressed={readerSettings.pdf.fit === fit}
+                              >
+                                {fit}
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+
+                        <div>
+                          <div className="text-[10px] uppercase tracking-wider text-[color:var(--ink)]/60">
+                            Zoom
+                          </div>
+                          <div className="mt-2 flex items-center gap-2">
+                            <button
+                              type="button"
+                              className="rounded-md border border-[color:var(--accent-soft)] px-2 py-1 text-sm hover:bg-[color:var(--paper-deep)] transition-colors"
+                              onClick={() =>
+                                updateReaderSettings({
+                                  pdf: {
+                                    zoom: Math.max(
+                                      0.5,
+                                      readerSettings.pdf.zoom - 0.1,
+                                    ),
+                                  },
+                                })
+                              }
+                            >
+                              -
+                            </button>
                             <input
-                              className="w-full"
+                              className="flex-1"
                               type="range"
-                              min="1.2"
-                              max="2.4"
-                              step="0.05"
-                              value={readerSettings.lineHeight}
+                              min="0.5"
+                              max="4"
+                              step="0.1"
+                              value={readerSettings.pdf.zoom}
                               onChange={(e) =>
                                 updateReaderSettings({
-                                  lineHeight: Number(e.target.value),
+                                  pdf: { zoom: Number(e.target.value) },
                                 })
                               }
                             />
+                            <button
+                              type="button"
+                              className="rounded-md border border-[color:var(--accent-soft)] px-2 py-1 text-sm hover:bg-[color:var(--paper-deep)] transition-colors"
+                              onClick={() =>
+                                updateReaderSettings({
+                                  pdf: {
+                                    zoom: Math.min(
+                                      4,
+                                      readerSettings.pdf.zoom + 0.1,
+                                    ),
+                                  },
+                                })
+                              }
+                            >
+                              +
+                            </button>
                             <div className="w-12 text-right text-xs text-[color:var(--ink)]/70 tabular-nums">
-                              {readerSettings.lineHeight.toFixed(2)}
+                              {Math.round(readerSettings.pdf.zoom * 100)}%
                             </div>
                           </div>
                         </div>
                       </div>
-                    </div>
+                    ) : (
+                      <>
+                        <div className="mt-3">
+                          <div className="text-[10px] uppercase tracking-wider text-[color:var(--ink)]/60">
+                            Theme
+                          </div>
+                          <div className="mt-2 grid grid-cols-3 gap-2">
+                            {(
+                              Object.keys(
+                                THEME_PRESETS,
+                              ) as Array<EpubReaderV2ThemePreset>
+                            ).map((preset) => {
+                              const config = THEME_PRESETS[preset]
+                              const active =
+                                readerSettings.themePreset === preset
+                              return (
+                                <button
+                                  key={preset}
+                                  type="button"
+                                  className={[
+                                    'relative rounded-lg border p-2 text-left transition-colors',
+                                    active
+                                      ? 'border-[color:var(--accent)]'
+                                      : 'border-[color:var(--accent-soft)] hover:border-[color:var(--accent)]',
+                                  ].join(' ')}
+                                  style={{
+                                    background: config.bg,
+                                    color: config.fg,
+                                  }}
+                                  onClick={() => {
+                                    updateReaderSettings({
+                                      themePreset: preset,
+                                      theme: config.theme,
+                                      fontFamily: config.fontFamily,
+                                    })
+                                  }}
+                                  aria-pressed={active}
+                                >
+                                  <div
+                                    className="text-sm leading-none"
+                                    style={{ fontWeight: config.fontWeight }}
+                                  >
+                                    Aa
+                                  </div>
+                                  <div className="mt-1 text-[10px] opacity-70">
+                                    {config.name}
+                                  </div>
+                                  {active && (
+                                    <Check className="absolute right-2 top-2 h-3.5 w-3.5 opacity-80" />
+                                  )}
+                                </button>
+                              )
+                            })}
+                          </div>
+                        </div>
 
-                    <div className="mt-4">
-                      <div className="text-[10px] uppercase tracking-wider text-[color:var(--ink)]/60">
-                        Layout
-                      </div>
-                      <div className="mt-2 text-sm text-[color:var(--ink)]/70">
-                        Fixed: paginated, left aligned, medium margins
-                      </div>
-                    </div>
+                        <div className="mt-4">
+                          <div className="text-[10px] uppercase tracking-wider text-[color:var(--ink)]/60">
+                            Text
+                          </div>
+
+                          <div className="mt-2 grid grid-cols-2 gap-2">
+                            <div className="col-span-2">
+                              <label className="block text-xs text-[color:var(--ink)]/70">
+                                Font
+                              </label>
+                              <select
+                                className="mt-1 w-full rounded-md border border-[color:var(--accent-soft)] bg-[color:var(--paper)] px-2 py-1 text-sm"
+                                value={readerSettings.fontFamily}
+                                onChange={(e) => {
+                                  const value = e.target
+                                    .value as typeof readerSettings.fontFamily
+                                  updateReaderSettings({ fontFamily: value })
+                                }}
+                              >
+                                <option value="publisher">Publisher</option>
+                                <option value="serif">Serif</option>
+                                <option value="sans">Sans</option>
+                              </select>
+                            </div>
+
+                            <div className="col-span-2">
+                              <label className="block text-xs text-[color:var(--ink)]/70">
+                                Font size
+                              </label>
+                              <div className="mt-1 flex items-center gap-2">
+                                <button
+                                  type="button"
+                                  className="rounded-md border border-[color:var(--accent-soft)] px-2 py-1 text-sm hover:bg-[color:var(--paper-deep)] transition-colors"
+                                  onClick={() => {
+                                    const next = Math.max(
+                                      0.7,
+                                      readerSettings.fontScale - 0.05,
+                                    )
+                                    updateReaderSettings({ fontScale: next })
+                                  }}
+                                >
+                                  A-
+                                </button>
+                                <div className="flex-1">
+                                  <input
+                                    className="w-full"
+                                    type="range"
+                                    min="0.7"
+                                    max="1.5"
+                                    step="0.05"
+                                    value={readerSettings.fontScale}
+                                    onChange={(e) =>
+                                      updateReaderSettings({
+                                        fontScale: Number(e.target.value),
+                                      })
+                                    }
+                                  />
+                                </div>
+                                <button
+                                  type="button"
+                                  className="rounded-md border border-[color:var(--accent-soft)] px-2 py-1 text-sm hover:bg-[color:var(--paper-deep)] transition-colors"
+                                  onClick={() => {
+                                    const next = Math.min(
+                                      1.5,
+                                      readerSettings.fontScale + 0.05,
+                                    )
+                                    updateReaderSettings({ fontScale: next })
+                                  }}
+                                >
+                                  A+
+                                </button>
+                              </div>
+                            </div>
+
+                            <div className="col-span-2">
+                              <label className="block text-xs text-[color:var(--ink)]/70">
+                                Line height
+                              </label>
+                              <div className="mt-1 flex items-center gap-2">
+                                <input
+                                  className="w-full"
+                                  type="range"
+                                  min="1.2"
+                                  max="2.4"
+                                  step="0.05"
+                                  value={readerSettings.lineHeight}
+                                  onChange={(e) =>
+                                    updateReaderSettings({
+                                      lineHeight: Number(e.target.value),
+                                    })
+                                  }
+                                />
+                                <div className="w-12 text-right text-xs text-[color:var(--ink)]/70 tabular-nums">
+                                  {readerSettings.lineHeight.toFixed(2)}
+                                </div>
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+
+                        <div className="mt-4">
+                          <div className="text-[10px] uppercase tracking-wider text-[color:var(--ink)]/60">
+                            Layout
+                          </div>
+                          <div className="mt-2 text-sm text-[color:var(--ink)]/70">
+                            Fixed: paginated, left aligned, medium margins
+                          </div>
+                        </div>
+                      </>
+                    )}
                   </div>
                 ) : (
                   <div className="p-3">
@@ -1671,6 +2029,7 @@ function App() {
                               const file = e.target.files?.[0]
                               e.target.value = ''
                               if (!file) return
+                              if (!isValidUploadFile(file)) return
                               uploadMutation.mutate(file)
                             }}
                           />
@@ -1794,7 +2153,7 @@ function App() {
                             me !== null && (
                               <div className="text-sm text-[color:var(--ink)]/70 h-full flex-1 flex flex-col items-center gap-1 justify-center">
                                 <Upload className="w-5 h-5 text-[color:var(--accent)]" />
-                                <span>Drop EPUB to upload</span>
+                                <span>Drop EPUB or PDF to upload</span>
                               </div>
                             )}
                           {rowVirtualizer
@@ -1856,6 +2215,11 @@ function App() {
                                           : book.thumbnail_url
                                       const isSelected =
                                         selectedBookId === book.id
+                                      const isPdf =
+                                        getBookFormat(book) === 'pdf'
+                                      const isPdfProcessing =
+                                        isPdf &&
+                                        book.pdf_has_text_layer === null
                                       const canDeletePersonalBook =
                                         libraryScope === 'personal' &&
                                         Boolean(me) &&
@@ -1881,14 +2245,28 @@ function App() {
                                                   updateSelectedBook(book.id)
                                                 }
                                                 className={[
-                                                  'flex-1 min-w-0 px-3 py-1 text-left text-xs transition-colors truncate',
+                                                  'flex-1 min-w-0 px-3 py-1 text-left text-xs transition-colors',
                                                   isSelected
                                                     ? 'text-[color:var(--ink)]'
                                                     : 'text-[color:var(--ink)]/90',
                                                 ].join(' ')}
                                                 aria-pressed={isSelected}
                                               >
-                                                {title}
+                                                <span className="flex min-w-0 items-center gap-1">
+                                                  <span className="min-w-0 truncate">
+                                                    {title}
+                                                  </span>
+                                                  {isPdf && (
+                                                    <span className="shrink-0 rounded border border-[color:var(--accent-soft)] px-1 text-[9px] font-medium leading-4 text-[color:var(--ink)]/70">
+                                                      PDF
+                                                    </span>
+                                                  )}
+                                                  {isPdfProcessing && (
+                                                    <span className="shrink-0 rounded border border-[color:var(--accent-soft)] bg-[color:var(--paper-deep)] px-1 text-[9px] leading-4 text-[color:var(--ink)]/60">
+                                                      Processing…
+                                                    </span>
+                                                  )}
+                                                </span>
                                               </button>
                                             </HoverCardTrigger>
                                             {canDeletePersonalBook && (
@@ -1969,25 +2347,59 @@ function App() {
         <main className="relative flex-1 min-h-0 bg-[color:var(--paper-deep)]">
           {!isLibraryLoading && selectedBook ? (
             <div className="relative h-full">
-              <EpubReaderV2
-                ref={readerRef}
-                storageId={selectedBook.id}
-                bookUrl={getBookFileUrl(selectedBook.id)}
-                transformationData={selectedBook.transformation_data}
-                onSelectionChange={setReaderSelectionToken}
-                onAddSelectionToChat={(sel) =>
-                  insertSelectionToChat(sel, 'current')
-                }
-                onTocChange={setReaderTocToken}
-                pendingNavigation={pendingReaderNavigation}
-                onConsumePendingNavigation={(id) => {
-                  setPendingReaderNavigation((prev) =>
-                    prev?.id === id ? null : prev,
-                  )
-                }}
-                onStatusChange={setReaderStatus}
-                className="h-full"
-              />
+              {selectedBookIsPdf ? (
+                <PdfReader
+                  key={selectedBook.id}
+                  ref={readerRef}
+                  bookUrl={getBookFileUrl(selectedBook.id)}
+                  bookId={selectedBook.id}
+                  bookTitle={selectedBook.title}
+                  hasTextLayer={selectedBook.pdf_has_text_layer}
+                  initialPage={loadStoredPdfPage(selectedBook.id)}
+                  initialSettings={{
+                    ...readerSettings.pdf,
+                    theme: readerSettings.theme,
+                  }}
+                  onReady={() => setReaderStatus('ready')}
+                  onError={() => setReaderStatus('error')}
+                  onLocationChange={(loc) => {
+                    storePdfPage(selectedBook.id, loc.pageIndex)
+                    setPdfLocation(loc)
+                  }}
+                  onSelectionChange={(sel) => {
+                    setReaderSelectionToken(
+                      sel && !sel.imageDataUrl
+                        ? toReaderSelectionToken(sel)
+                        : null,
+                    )
+                  }}
+                  onAddSelectionToChat={(sel) =>
+                    insertPdfSelectionToChat(sel, 'current')
+                  }
+                  onTocChange={setReaderTocToken}
+                  className="h-full"
+                />
+              ) : (
+                <EpubReaderV2
+                  ref={readerRef}
+                  storageId={selectedBook.id}
+                  bookUrl={getBookFileUrl(selectedBook.id)}
+                  transformationData={selectedBook.transformation_data}
+                  onSelectionChange={setReaderSelectionToken}
+                  onAddSelectionToChat={(sel) =>
+                    insertSelectionToChat(sel, 'current')
+                  }
+                  onTocChange={setReaderTocToken}
+                  pendingNavigation={pendingReaderNavigation}
+                  onConsumePendingNavigation={(id) => {
+                    setPendingReaderNavigation((prev) =>
+                      prev?.id === id ? null : prev,
+                    )
+                  }}
+                  onStatusChange={setReaderStatus}
+                  className="h-full"
+                />
+              )}
             </div>
           ) : (
             <></>
@@ -2043,7 +2455,33 @@ function App() {
                       bookId: readerTocToken.bookId,
                       bookTitle: readerTocToken.bookTitle,
                       metadata: readerTocToken.metadata,
+                      format: selectedBookFormat,
+                      hasTextLayer: activeReaderIsPdf
+                        ? (selectedBook?.pdf_has_text_layer ?? null)
+                        : null,
+                      pageCount:
+                        selectedBook?.page_count ??
+                        pdfLocation?.pageCount ??
+                        null,
                     }
+                  : null
+              }
+              activeBookFormat={selectedBookFormat}
+              pdfVisiblePages={
+                activeReaderIsPdf
+                  ? (pdfLocation?.visiblePageIndices ?? []).map(
+                      (pageIndex, index) => ({
+                        pageIndex,
+                        label:
+                          pdfLocation?.visiblePageLabels[index] ??
+                          String(pageIndex + 1),
+                      }),
+                    )
+                  : []
+              }
+              pdfPageCount={
+                activeReaderIsPdf
+                  ? (selectedBook?.page_count ?? pdfLocation?.pageCount ?? null)
                   : null
               }
               getCurrentReaderPage={getCurrentReaderPage}
@@ -2052,6 +2490,9 @@ function App() {
               getCurrentReaderPagePartsStable={getCurrentReaderPagePartsStable}
               getSpineItemText={getSpineItemText}
               getSpineItemParts={getSpineItemParts}
+              getPageRangeParts={
+                activeReaderIsPdf ? getPageRangeParts : undefined
+              }
             />
           </ResizableWindow>
         </div>

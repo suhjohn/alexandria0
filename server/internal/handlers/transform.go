@@ -84,11 +84,6 @@ func NewBookTransformHandler(
 }
 
 func (h *BookTransformHandler) StartTransform(w http.ResponseWriter, r *http.Request) {
-	if strings.TrimSpace(h.apiKey) == "" {
-		http.Error(w, "Transform API key not configured", http.StatusInternalServerError)
-		return
-	}
-
 	bookID, err := parseBookID(r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -107,6 +102,16 @@ func (h *BookTransformHandler) StartTransform(w http.ResponseWriter, r *http.Req
 
 	if err := h.ensureAccess(r, book); err != nil {
 		http.Error(w, err.Error(), http.StatusForbidden)
+		return
+	}
+	if err := ensureTransformSourceSupported(book); err != nil {
+		respondJSONStatus(w, http.StatusUnprocessableEntity, map[string]string{
+			"error": err.Error(),
+		})
+		return
+	}
+	if strings.TrimSpace(h.apiKey) == "" {
+		http.Error(w, "Transform API key not configured", http.StatusInternalServerError)
 		return
 	}
 
@@ -242,11 +247,6 @@ func (h *BookTransformHandler) StartTransform(w http.ResponseWriter, r *http.Req
 }
 
 func (h *BookTransformHandler) GetTransform(w http.ResponseWriter, r *http.Request) {
-	if strings.TrimSpace(h.apiKey) == "" {
-		http.Error(w, "Transform API key not configured", http.StatusInternalServerError)
-		return
-	}
-
 	bookID, err := parseBookID(r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -265,6 +265,16 @@ func (h *BookTransformHandler) GetTransform(w http.ResponseWriter, r *http.Reque
 
 	if err := h.ensureAccess(r, book); err != nil {
 		http.Error(w, err.Error(), http.StatusForbidden)
+		return
+	}
+	if err := ensureTransformSourceSupported(book); err != nil {
+		respondJSONStatus(w, http.StatusUnprocessableEntity, map[string]string{
+			"error": err.Error(),
+		})
+		return
+	}
+	if strings.TrimSpace(h.apiKey) == "" {
+		http.Error(w, "Transform API key not configured", http.StatusInternalServerError)
 		return
 	}
 
@@ -507,6 +517,12 @@ func respondJSON(w http.ResponseWriter, payload any) {
 	json.NewEncoder(w).Encode(payload)
 }
 
+func respondJSONStatus(w http.ResponseWriter, status int, payload any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(payload)
+}
+
 func transformURLFromBook(book *models.Book, variantKey string) string {
 	if book.TransformationData == nil {
 		return ""
@@ -516,6 +532,13 @@ func transformURLFromBook(book *models.Book, variantKey string) string {
 		return urls[0]
 	}
 	return ""
+}
+
+func ensureTransformSourceSupported(book *models.Book) error {
+	if book != nil && strings.EqualFold(book.Format, "pdf") {
+		return errors.New("PDF transforms are not supported")
+	}
+	return nil
 }
 
 func sourceEPUBKeyFromBook(book *models.Book, r2 *storage.R2Client) (string, error) {

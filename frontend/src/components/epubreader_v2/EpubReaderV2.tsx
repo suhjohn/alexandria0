@@ -115,6 +115,7 @@ export type EpubReaderV2Props = {
   bookUrl: string
   transformedBookUrl?: string
   transformationData?: Record<string, string[]>
+  disableTransformMenu?: boolean
   storageId?: string
   authHeaders?: Record<string, string>
   initialSettings?: Partial<EpubReaderV2Settings>
@@ -695,11 +696,39 @@ function uint8ArrayToBase64(bytes: Uint8Array): string {
   return btoa(binary)
 }
 
+function normalizeOptionalImageCount(value: unknown): number | undefined {
+  if (value === undefined) return undefined
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed)) return undefined
+  return Math.max(0, parsed)
+}
+
+function normalizeOptionalImageBytes(value: unknown): number | undefined {
+  if (value === undefined) return undefined
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed)) return undefined
+  return Math.max(1, parsed)
+}
+
+function imageLimitReached(
+  usedImages: number,
+  maxImages: number | undefined,
+): boolean {
+  return maxImages !== undefined && usedImages >= maxImages
+}
+
+function exceedsImageByteLimit(
+  byteLength: number,
+  maxImageBytes: number | undefined,
+): boolean {
+  return maxImageBytes !== undefined && byteLength > maxImageBytes
+}
+
 async function fetchImageToPart(options: {
   src: string
   store?: EpubResourceStore | null
   epubPathHint?: string | null
-  maxImageBytes: number
+  maxImageBytes?: number
 }): Promise<ImagePart | null> {
   const { src, store, epubPathHint, maxImageBytes } = options
   const trimmed = String(src ?? '').trim()
@@ -712,14 +741,14 @@ async function fetchImageToPart(options: {
     const base64 = String(match[2] ?? '').trim()
     if (!mediaType || !base64) return null
     const approxBytes = Math.floor((base64.length * 3) / 4)
-    if (approxBytes > maxImageBytes) return null
+    if (exceedsImageByteLimit(approxBytes, maxImageBytes)) return null
     return { type: 'image', image: base64, mediaType }
   }
 
   const hint = String(epubPathHint ?? '').trim()
   if (hint && store) {
     const bytes = await store.readBytes(hint)
-    if (bytes.byteLength > maxImageBytes) return null
+    if (exceedsImageByteLimit(bytes.byteLength, maxImageBytes)) return null
     return {
       type: 'image',
       image: uint8ArrayToBase64(bytes),
@@ -730,7 +759,8 @@ async function fetchImageToPart(options: {
   if (trimmed.startsWith('blob:')) {
     const res = await fetch(trimmed)
     const arrayBuffer = await res.arrayBuffer()
-    if (arrayBuffer.byteLength > maxImageBytes) return null
+    if (exceedsImageByteLimit(arrayBuffer.byteLength, maxImageBytes))
+      return null
     const mediaType = res.headers.get('content-type') ?? undefined
     return {
       type: 'image',
@@ -966,8 +996,8 @@ async function extractVisibleParts(options: {
   flowMode: EpubReaderV2Settings['flowMode']
   store?: EpubResourceStore | null
   maxChars: number
-  maxImages: number
-  maxImageBytes: number
+  maxImages?: number
+  maxImageBytes?: number
 }): Promise<Array<TextPart | ImagePart>> {
   const { doc, layout, flowMode, store, maxChars, maxImages, maxImageBytes } =
     options
@@ -985,14 +1015,15 @@ async function extractVisibleParts(options: {
     })
     if (text) parts.push({ type: 'text', text })
 
-    if (maxImages > 0) {
+    if (maxImages !== 0) {
       const imgs = Array.from(
         root.querySelectorAll('img'),
       ) as HTMLImageElement[]
       const marginY = 16
       const marginX = 2
+      let usedImages = 0
       for (const img of imgs) {
-        if (parts.filter((p) => p.type === 'image').length >= maxImages) break
+        if (imageLimitReached(usedImages, maxImages)) break
         const rects = Array.from(img.getClientRects?.() ?? [])
         const isVisible = rects.some((rect) => {
           if (rect.height < 1 || rect.width < 1) return false
@@ -1023,7 +1054,10 @@ async function extractVisibleParts(options: {
             epubPathHint: epubPathHint || null,
             maxImageBytes,
           })
-          if (imagePart) parts.push(imagePart)
+          if (imagePart) {
+            parts.push(imagePart)
+            usedImages += 1
+          }
         } catch {
           // ignore
         }
@@ -1163,10 +1197,10 @@ async function extractVisibleParts(options: {
   })
 
   for (const { el } of prunedVisibleBlocks) {
-    if (usedText >= maxChars && usedImages >= maxImages) break
+    if (usedText >= maxChars && imageLimitReached(usedImages, maxImages)) break
 
     if (el instanceof HTMLImageElement) {
-      if (usedImages >= maxImages) continue
+      if (imageLimitReached(usedImages, maxImages)) continue
       const alt = String(
         el.getAttribute('alt') ?? el.getAttribute('title') ?? '',
       ).trim()
@@ -1245,8 +1279,8 @@ async function extractSpineItemParts(options: {
   xhtmlPath: string
   store: EpubResourceStore
   maxChars: number
-  maxImages: number
-  maxImageBytes: number
+  maxImages?: number
+  maxImageBytes?: number
 }): Promise<Array<TextPart | ImagePart>> {
   const { xhtmlText, xhtmlPath, store, maxChars, maxImages, maxImageBytes } =
     options
@@ -1263,6 +1297,11 @@ async function extractSpineItemParts(options: {
   let includedImages = 0
   let includedBytes = 0
 
+  const wouldExceedAggregateImageBytes = (byteLength: number): boolean => {
+    if (maxImages === undefined || maxImageBytes === undefined) return false
+    return includedBytes + byteLength > maxImageBytes * maxImages
+  }
+
   const getImagePart = async (rawSrc: string): Promise<ImagePart | null> => {
     const src = String(rawSrc ?? '').trim()
     if (!src) return null
@@ -1274,8 +1313,8 @@ async function extractSpineItemParts(options: {
       const base64 = String(match[2] ?? '').trim()
       if (!mediaType || !base64) return null
       const approxBytes = Math.floor((base64.length * 3) / 4)
-      if (approxBytes > maxImageBytes) return null
-      if (includedBytes + approxBytes > maxImageBytes * maxImages) return null
+      if (exceedsImageByteLimit(approxBytes, maxImageBytes)) return null
+      if (wouldExceedAggregateImageBytes(approxBytes)) return null
       includedBytes += approxBytes
       return { type: 'image', image: base64, mediaType }
     }
@@ -1288,9 +1327,8 @@ async function extractSpineItemParts(options: {
     if (!path) return null
     const resolved = resolveRelativePath(xhtmlPath, path)
     const bytes = await store.readBytes(resolved)
-    if (bytes.byteLength > maxImageBytes) return null
-    if (includedBytes + bytes.byteLength > maxImageBytes * maxImages)
-      return null
+    if (exceedsImageByteLimit(bytes.byteLength, maxImageBytes)) return null
+    if (wouldExceedAggregateImageBytes(bytes.byteLength)) return null
     includedBytes += bytes.byteLength
     return {
       type: 'image',
@@ -1301,7 +1339,7 @@ async function extractSpineItemParts(options: {
 
   for (let i = 0; i < images.length; i++) {
     const imgEl = images[i]
-    if (includedImages >= maxImages) {
+    if (imageLimitReached(includedImages, maxImages)) {
       imgEl.remove()
       continue
     }
@@ -1673,6 +1711,7 @@ function pickInitialVariant(args: {
 
 type EpubReaderV2InnerProps = Omit<EpubReaderV2Props, 'storageId'> & {
   baseStorageId: string
+  locationStorageId: string
   initialVariant: ReaderVariant
 }
 
@@ -1684,7 +1723,9 @@ const EpubReaderV2Inner = forwardRef<
     bookUrl,
     transformedBookUrl,
     transformationData,
+    disableTransformMenu = false,
     baseStorageId,
+    locationStorageId,
     authHeaders,
     initialSettings,
     onReady,
@@ -1784,6 +1825,10 @@ const EpubReaderV2Inner = forwardRef<
 
   const resolvedVariantUrl = useMemo(() => {
     if (variant === 'original') return ''
+    if (variant === 'modernify') {
+      const fromProp = String(transformedBookUrl ?? '').trim()
+      if (fromProp) return fromProp
+    }
     const fromStatus =
       transformStatuses[variant]?.status === 'ready'
         ? String(transformStatuses[variant]?.url ?? '').trim()
@@ -3110,8 +3155,8 @@ const EpubReaderV2Inner = forwardRef<
         flowMode,
         store,
         maxChars: Math.max(1, Number(options?.maxChars ?? 8000)),
-        maxImages: Math.max(0, Number(options?.maxImages ?? 3)),
-        maxImageBytes: Math.max(1, Number(options?.maxImageBytes ?? 1_500_000)),
+        maxImages: normalizeOptionalImageCount(options?.maxImages),
+        maxImageBytes: normalizeOptionalImageBytes(options?.maxImageBytes),
       })
     },
     [],
@@ -3178,11 +3223,8 @@ const EpubReaderV2Inner = forwardRef<
             xhtmlPath: href,
             store,
             maxChars: Math.max(1, Number(options?.maxChars ?? 18_000)),
-            maxImages: Math.max(0, Number(options?.maxImages ?? 6)),
-            maxImageBytes: Math.max(
-              1,
-              Number(options?.maxImageBytes ?? 1_500_000),
-            ),
+            maxImages: normalizeOptionalImageCount(options?.maxImages),
+            maxImageBytes: normalizeOptionalImageBytes(options?.maxImageBytes),
           })
         } catch {
           return null
@@ -4202,7 +4244,8 @@ const EpubReaderV2Inner = forwardRef<
           rendition: pub.rendition,
         })
 
-        const persistenceId = baseStorageId || pub.bookId || ''
+        const persistenceId =
+          locationStorageId || baseStorageId || pub.bookId || ''
         persistenceIdRef.current = persistenceId
         const pendingVariantRestore = pendingVariantRestoreRef.current
         if (
@@ -4518,8 +4561,8 @@ const EpubReaderV2Inner = forwardRef<
       ? String(transformStatuses.modernify?.url ?? '').trim()
       : ''
   const modernifyUrlFromBook =
-    String(transformationData?.modernify?.[0] ?? '').trim() ||
-    String(transformedBookUrl ?? '').trim()
+    String(transformedBookUrl ?? '').trim() ||
+    String(transformationData?.modernify?.[0] ?? '').trim()
   const modernifyAvailable = Boolean(
     modernifyUrlFromStatus || modernifyUrlFromBook,
   )
@@ -5509,18 +5552,20 @@ const EpubReaderV2Inner = forwardRef<
             {chromeTitle}
           </div>
           <div className="mfv2-reader__topbarRight">
-            <button
-              className={`mfv2-reader__iconBtn ${versionsOpen ? 'is-active' : ''}`}
-              type="button"
-              onClick={() => {
-                setVersionsOpen((v) => !v)
-                setTocOpen(false)
-                setSettingsOpen(false)
-              }}
-              title="Choose version"
-            >
-              <IoSparkles />
-            </button>
+            {!disableTransformMenu && (
+              <button
+                className={`mfv2-reader__iconBtn ${versionsOpen ? 'is-active' : ''}`}
+                type="button"
+                onClick={() => {
+                  setVersionsOpen((v) => !v)
+                  setTocOpen(false)
+                  setSettingsOpen(false)
+                }}
+                title="Choose version"
+              >
+                <IoSparkles />
+              </button>
+            )}
           </div>
         </div>
 
@@ -5536,7 +5581,7 @@ const EpubReaderV2Inner = forwardRef<
           />
         )}
 
-        {versionsOpen && (
+        {versionsOpen && !disableTransformMenu && (
           <div
             className="mfv2-reader__versionsPanel"
             role="dialog"
@@ -6305,7 +6350,13 @@ export const EpubReaderV2 = forwardRef<EpubReaderV2Handle, EpubReaderV2Props>(
       transformedBookUrl,
     })
 
-    const key = [baseStorageId, bookUrl, requestedVariant ?? ''].join('|')
+    const locationStorageId = String(storageId ?? '').trim()
+    const key = [
+      baseStorageId,
+      locationStorageId,
+      bookUrl,
+      requestedVariant ?? '',
+    ].join('|')
 
     return (
       <EpubReaderV2Inner
@@ -6316,6 +6367,7 @@ export const EpubReaderV2 = forwardRef<EpubReaderV2Handle, EpubReaderV2Props>(
         transformationData={transformationData}
         transformedBookUrl={transformedBookUrl}
         baseStorageId={baseStorageId}
+        locationStorageId={locationStorageId}
         initialVariant={initialVariant}
       />
     )

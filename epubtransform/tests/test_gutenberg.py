@@ -54,8 +54,8 @@ def test_parse_ebook_page_extracts_metadata_and_links() -> None:
     assert md.locc == ["PR"]
     assert md.release_date is not None
 
-    assert any(l.url.endswith("/ebooks/1342.epub.noimages") for l in links)
-    assert any("Plain Text" in l.label for l in links)
+    assert any(link.url.endswith("/ebooks/1342.epub.noimages") for link in links)
+    assert any("Plain Text" in link.label for link in links)
 
 
 def test_pick_best_download_link_prefers_epub_no_images() -> None:

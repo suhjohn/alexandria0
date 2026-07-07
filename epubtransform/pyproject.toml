@@ -15,7 +15,9 @@ dependencies = [
     "fastapi",
     "pydantic",
     "boto3",
-    "modal"
+    "modal",
+    "pymupdf",
+    "uvicorn",
 ]
 
 [project.scripts]

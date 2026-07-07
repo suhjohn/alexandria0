@@ -3,7 +3,23 @@ import type { EpubReaderV2Settings } from '@/components/epubreader_v2/types'
 
 export const READER_SETTINGS_STORAGE_KEY = 'mfv2:readerSettings'
 
-export const DEFAULT_READER_SETTINGS: EpubReaderV2Settings = {
+export type PdfReaderPersistedSettings = {
+  spread: 'auto' | 'single' | 'double'
+  fit: 'width' | 'page'
+  zoom: number
+}
+
+export type ReaderSettings = EpubReaderV2Settings & {
+  pdf: PdfReaderPersistedSettings
+}
+
+export const DEFAULT_PDF_READER_SETTINGS: PdfReaderPersistedSettings = {
+  spread: 'auto',
+  fit: 'page',
+  zoom: 1,
+}
+
+export const DEFAULT_READER_SETTINGS: ReaderSettings = {
   theme: 'dark',
   flowMode: 'paginated',
   fontScale: 1,
@@ -15,6 +31,7 @@ export const DEFAULT_READER_SETTINGS: EpubReaderV2Settings = {
   textAlign: 'left',
   marginSize: 'medium',
   themePreset: 'quiet',
+  pdf: DEFAULT_PDF_READER_SETTINGS,
 }
 
 const LOCAL_EVENT = 'mfv2:readerSettings:changed'
@@ -32,11 +49,31 @@ function safeParse(raw: string | null): unknown {
   }
 }
 
-function coerceSettings(raw: unknown): Partial<EpubReaderV2Settings> | null {
+function coercePdfSettings(raw: unknown): Partial<PdfReaderPersistedSettings> {
+  if (!raw || typeof raw !== 'object') return {}
+  const obj = raw as Record<string, unknown>
+  const next: Partial<PdfReaderPersistedSettings> = {}
+  if (
+    obj.spread === 'auto' ||
+    obj.spread === 'single' ||
+    obj.spread === 'double'
+  ) {
+    next.spread = obj.spread
+  }
+  if (obj.fit === 'width' || obj.fit === 'page') {
+    next.fit = obj.fit
+  }
+  if (typeof obj.zoom === 'number' && Number.isFinite(obj.zoom)) {
+    next.zoom = clamp(obj.zoom, 0.5, 4)
+  }
+  return next
+}
+
+function coerceSettings(raw: unknown): Partial<ReaderSettings> | null {
   if (!raw || typeof raw !== 'object') return null
   const obj = raw as Record<string, unknown>
 
-  const next: Partial<EpubReaderV2Settings> = {}
+  const next: Partial<ReaderSettings> = {}
 
   if (obj.theme === 'light' || obj.theme === 'sepia' || obj.theme === 'dark') {
     next.theme = obj.theme
@@ -79,6 +116,10 @@ function coerceSettings(raw: unknown): Partial<EpubReaderV2Settings> | null {
   ) {
     next.themePreset = obj.themePreset
   }
+  next.pdf = {
+    ...DEFAULT_PDF_READER_SETTINGS,
+    ...coercePdfSettings(obj.pdf),
+  }
 
   return next
 }
@@ -110,19 +151,25 @@ function subscribe(callback: () => void) {
 }
 
 function normalizeReaderSettings(
-  settings: EpubReaderV2Settings,
-): EpubReaderV2Settings {
+  settings: EpubReaderV2Settings & {
+    pdf?: Partial<PdfReaderPersistedSettings>
+  },
+): ReaderSettings {
   return {
     ...settings,
     flowMode: 'paginated',
     textAlign: 'left',
     marginSize: 'medium',
+    pdf: {
+      ...DEFAULT_PDF_READER_SETTINGS,
+      ...coercePdfSettings(settings.pdf),
+    },
   }
 }
 
 export function getReaderSettings(
   base?: Partial<EpubReaderV2Settings>,
-): EpubReaderV2Settings {
+): ReaderSettings {
   const stored = coerceSettings(safeParse(readRawSettings()))
   if (stored)
     return normalizeReaderSettings({
@@ -134,10 +181,17 @@ export function getReaderSettings(
   return normalizeReaderSettings(DEFAULT_READER_SETTINGS)
 }
 
-export function setReaderSettings(settings: EpubReaderV2Settings) {
+export function setReaderSettings(
+  settings: EpubReaderV2Settings & {
+    pdf?: Partial<PdfReaderPersistedSettings>
+  },
+) {
   if (typeof window === 'undefined' || typeof localStorage === 'undefined')
     return
-  const normalized = normalizeReaderSettings(settings)
+  const normalized = normalizeReaderSettings({
+    ...settings,
+    pdf: settings.pdf ?? getReaderSettings().pdf,
+  })
   try {
     localStorage.setItem(
       READER_SETTINGS_STORAGE_KEY,
@@ -154,16 +208,26 @@ export function setReaderSettings(settings: EpubReaderV2Settings) {
 }
 
 export function updateReaderSettings(
-  patch: Partial<EpubReaderV2Settings>,
-): EpubReaderV2Settings {
-  const next = normalizeReaderSettings({ ...getReaderSettings(), ...patch })
+  patch: Partial<EpubReaderV2Settings> & {
+    pdf?: Partial<PdfReaderPersistedSettings>
+  },
+): ReaderSettings {
+  const current = getReaderSettings()
+  const next = normalizeReaderSettings({
+    ...current,
+    ...patch,
+    pdf: {
+      ...current.pdf,
+      ...(patch.pdf ?? {}),
+    },
+  })
   setReaderSettings(next)
   return next
 }
 
 export function useReaderSettings(
   base?: Partial<EpubReaderV2Settings>,
-): EpubReaderV2Settings {
+): ReaderSettings {
   const raw = useSyncExternalStore(
     subscribe,
     () => readRawSettings(),

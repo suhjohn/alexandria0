@@ -48,7 +48,19 @@ test.describe('Home route (production build)', () => {
       throw new Error('Failed to load books from backend.')
     }
 
-    const firstBookButton = bookButtons.first()
+    const allBookButtons = await bookButtons.all()
+    let firstBookButton: (typeof allBookButtons)[number] | null = null
+    for (const button of allBookButtons) {
+      const label = (await button.innerText()).trim()
+      if (!/\bPDF\b/.test(label)) {
+        firstBookButton = button
+        break
+      }
+    }
+    if (!firstBookButton) {
+      test.skip(true, 'No public EPUB books found (seed your backend and retry).')
+      return
+    }
     const firstBookTitle = (await firstBookButton.innerText()).trim()
     expect(firstBookTitle).not.toBe('')
 
@@ -113,7 +125,7 @@ test.describe('Home route (production build)', () => {
     if (chapterTitle) {
       await composer.click()
       await composer.type('@')
-      const chapterMenu = page.getByText('Chapters')
+      const chapterMenu = page.getByText('References')
       await expect(chapterMenu).toBeVisible({ timeout: 10_000 })
 
       for (let i = 0; i < chapterIndex; i++) {
@@ -183,4 +195,3 @@ test.describe('Home route (production build)', () => {
     await expect(leftPanelRegion).toBeVisible()
   })
 })
-

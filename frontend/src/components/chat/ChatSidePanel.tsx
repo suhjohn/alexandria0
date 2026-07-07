@@ -12,7 +12,12 @@ import {
   useEditor,
 } from '@tiptap/react'
 import StarterKit from '@tiptap/starter-kit'
-import { streamText, type ImagePart, type ModelMessage, type TextPart } from 'ai'
+import {
+  streamText,
+  type ImagePart,
+  type ModelMessage,
+  type TextPart,
+} from 'ai'
 import {
   ArrowUp,
   Check,
@@ -77,6 +82,76 @@ function debugChatMentions(...args: Array<unknown>) {
   console.log('[mfv2][chat][mentions]', ...args)
 }
 
+const REFERENCE_TOO_LARGE_ERROR =
+  'This reference is too large to send (provider request size limit). Try referencing fewer pages.'
+
+function getErrorText(err: unknown): string {
+  if (err instanceof Error) {
+    return `${err.name} ${err.message}`.trim()
+  }
+  if (!err || typeof err !== 'object') return String(err ?? '')
+
+  const parts: string[] = []
+  const record = err as Record<string, unknown>
+  for (const key of ['name', 'message', 'statusText']) {
+    const value = record[key]
+    if (typeof value === 'string') parts.push(value)
+  }
+
+  const response = record.response
+  if (response && typeof response === 'object') {
+    const statusText = (response as Record<string, unknown>).statusText
+    if (typeof statusText === 'string') parts.push(statusText)
+  }
+
+  const data = record.data
+  if (data && typeof data === 'object') {
+    const dataRecord = data as Record<string, unknown>
+    const error = dataRecord.error
+    if (typeof dataRecord.message === 'string') parts.push(dataRecord.message)
+    if (error && typeof error === 'object') {
+      const errorMessage = (error as Record<string, unknown>).message
+      if (typeof errorMessage === 'string') parts.push(errorMessage)
+    } else if (typeof error === 'string') {
+      parts.push(error)
+    }
+  }
+
+  return parts.join(' ')
+}
+
+function getErrorStatus(err: unknown): number | null {
+  if (!err || typeof err !== 'object') return null
+  const record = err as Record<string, unknown>
+  const rawStatus =
+    record.statusCode ??
+    record.status ??
+    (record.response as Record<string, unknown> | undefined)?.status ??
+    null
+  const status = Number(rawStatus)
+  return Number.isFinite(status) ? status : null
+}
+
+function isRequestTooLargeError(err: unknown): boolean {
+  const text = getErrorText(err)
+  const mentionsSizeLimit =
+    /\b(size|limit|payload|bytes?|content length)\b/i.test(text) ||
+    /exceed|too large|request entity|maximum/i.test(text)
+  if (!mentionsSizeLimit) return false
+
+  const status = getErrorStatus(err)
+  if (status === 400 || status === 413) return true
+
+  if (!err || typeof err !== 'object') return false
+  const name = String((err as Record<string, unknown>).name ?? '')
+  return /APICallError/i.test(name)
+}
+
+function streamErrorMessage(err: unknown, fallback: string): string {
+  if (isRequestTooLargeError(err)) return REFERENCE_TOO_LARGE_ERROR
+  return err instanceof Error ? err.message : fallback
+}
+
 type BookRefInsert = {
   id: string
   kind: 'bookRef'
@@ -91,11 +166,25 @@ type BookRefInsert = {
   spineIndex: number
 }
 
+type ChatImageInsert = {
+  id: string
+  kind: 'chatImage'
+  target?: 'current' | 'lastSelected' | 'newConversation'
+  filename: string
+  mediaType: string
+  dataBase64: string
+  sizeBytes?: number | null
+  prefixText?: string
+}
+
+type ChatPendingInsert = BookRefInsert | ChatImageInsert
+
 type TiptapDoc = Record<string, any>
 
 type BookRefAttrs = {
   mentionSuggestionChar?: string
   id?: string | null
+  refKind?: 'chapter' | 'page-range' | null
   bookId?: string | null
   bookTitle?: string | null
   href?: string | null
@@ -106,6 +195,9 @@ type BookRefAttrs = {
   endIndex?: number | null
   selectedText?: string | null
   spineIndex?: number | null
+  pdfStartPage?: number | null
+  pdfEndPage?: number | null
+  pdfPageLabel?: string | null
 }
 
 type ChatImageAttrs = {
@@ -126,8 +218,32 @@ type BookRefNavigatePayload =
   | { bookId: string; href: string }
 
 type ChapterSuggestion = EpubReaderV2ChapterSuggestion
-type CurrentBookInfo = EpubReaderV2CurrentBook
+type CurrentBookInfo = EpubReaderV2CurrentBook & {
+  format?: ReaderFormat
+  hasTextLayer?: boolean | null
+  pageCount?: number | null
+}
 type CurrentReaderPage = EpubReaderV2VisiblePage
+type ReaderFormat = 'epub' | 'pdf'
+
+type PdfVisiblePageSuggestion = {
+  pageIndex: number
+  label: string
+}
+
+type PageRangeSuggestion = {
+  kind: 'page-range'
+  title: string
+  href: string
+  spineIndex: number
+  depth: number
+  startPage: number
+  endPage: number
+  pageLabel: string
+}
+
+type ChapterMentionSuggestion = ChapterSuggestion & { kind?: 'chapter' }
+type MentionSuggestion = ChapterMentionSuggestion | PageRangeSuggestion
 
 function createId() {
   if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) {
@@ -143,6 +259,23 @@ function titleFromFirstUserMessage(text: string) {
 
 function bookRefDisplayLabel(attrs: any) {
   const title = String(attrs?.bookTitle ?? '').trim() || 'Book'
+  const refKind = String(attrs?.refKind ?? '').trim()
+  const isPageRange =
+    refKind === 'page-range' ||
+    Number.isFinite(Number(attrs?.pdfStartPage ?? NaN)) ||
+    Number.isFinite(Number(attrs?.pdfEndPage ?? NaN))
+  if (isPageRange) {
+    const startPage = Number(attrs?.pdfStartPage ?? NaN)
+    const endPage = Number(attrs?.pdfEndPage ?? startPage)
+    const fallbackLabel =
+      Number.isFinite(startPage) && Number.isFinite(endPage)
+        ? startPage === endPage
+          ? String(startPage + 1)
+          : `${startPage + 1}–${endPage + 1}`
+        : ''
+    const pageLabel = String(attrs?.pdfPageLabel ?? '').trim() || fallbackLabel
+    return `@${title}(p.${pageLabel || '?'})`
+  }
   const chapterTitle = String(attrs?.chapterTitle ?? '').trim()
   if (chapterTitle) return `@${title}(chapter:${chapterTitle})`
   const startPage = Number(attrs?.startPage ?? 0)
@@ -158,10 +291,17 @@ function bookRefTextValue(attrs: any) {
   return bookRefDisplayLabel(attrs)
 }
 
-function visitTiptapDoc(
-  node: any,
-  visit: (n: any) => void,
-): void {
+function parseDataUrlImage(dataUrl: string): ChatImageAttrs | null {
+  const match = /^data:([^;]+);base64,(.+)$/i.exec(String(dataUrl ?? '').trim())
+  if (!match) return null
+  const mediaType = match[1] ?? ''
+  const dataBase64 = match[2] ?? ''
+  if (!mediaType || !dataBase64) return null
+  const sizeBytes = Math.ceil((dataBase64.length * 3) / 4)
+  return { mediaType, dataBase64, sizeBytes }
+}
+
+function visitTiptapDoc(node: any, visit: (n: any) => void): void {
   if (!node || typeof node !== 'object') return
   visit(node)
   const content = Array.isArray(node.content) ? node.content : []
@@ -175,6 +315,51 @@ function extractBookRefsFromDoc(doc: TiptapDoc): Array<BookRefAttrs> {
     const attrs = (n.attrs ?? {}) as BookRefAttrs
     refs.push(attrs)
   })
+  return refs
+}
+
+function extractPdfPageRefsFromText(
+  text: string,
+  currentBook: CurrentBookInfo | null | undefined,
+  activeBookFormat: ReaderFormat | undefined,
+  pdfPageCount: number | null | undefined,
+): Array<BookRefAttrs> {
+  if (activeBookFormat !== 'pdf' && currentBook?.format !== 'pdf') return []
+
+  const bookId = String(currentBook?.bookId ?? '').trim()
+  if (!bookId) return []
+
+  const refs: Array<BookRefAttrs> = []
+  const bookTitle = String(currentBook?.bookTitle ?? '').trim() || 'Book'
+  const pageCount = pdfPageCount ?? currentBook?.pageCount
+  const mentionPattern =
+    /@(?:p(?:age)?\.?\s*)?(\d{1,5})(?:\s*[-–—]\s*(\d{1,5}))?/gi
+
+  for (const match of String(text ?? '').matchAll(mentionPattern)) {
+    const index = match.index ?? 0
+    const previousChar = index > 0 ? text[index - 1] : ''
+    if (previousChar && /[\w.-]/.test(previousChar)) continue
+
+    const suggestion = numericPageSuggestion(
+      match[2] ? `${match[1]}-${match[2]}` : String(match[1] ?? ''),
+      pageCount,
+    )
+    if (!suggestion) continue
+
+    refs.push({
+      id: createId(),
+      refKind: 'page-range',
+      bookId,
+      bookTitle,
+      href: suggestion.href,
+      pdfStartPage: suggestion.startPage,
+      pdfEndPage: suggestion.endPage,
+      pdfPageLabel: suggestion.pageLabel,
+      spineIndex: suggestion.startPage,
+      startIndex: 0,
+    })
+  }
+
   return refs
 }
 
@@ -204,7 +389,9 @@ function toModelMessages(
 
       const doc = parseTiptapDoc(m.contentJson ?? null, m.content)
       const images = extractChatImagesFromDoc(doc).filter(
-        (img) => Boolean(String(img.dataBase64 ?? '').trim()) && Boolean(String(img.mediaType ?? '').trim()),
+        (img) =>
+          Boolean(String(img.dataBase64 ?? '').trim()) &&
+          Boolean(String(img.mediaType ?? '').trim()),
       )
 
       if (images.length === 0) {
@@ -292,6 +479,15 @@ const BookRefMention = (Mention as any).extend({
         renderHTML: (attributes: Record<string, any>) =>
           attributes.id ? { 'data-id': attributes.id } : {},
       },
+      refKind: {
+        default: 'chapter',
+        parseHTML: (element: HTMLElement) =>
+          element.getAttribute('data-ref-kind') ?? 'chapter',
+        renderHTML: (attributes: Record<string, any>) =>
+          attributes.refKind === 'page-range'
+            ? { 'data-ref-kind': attributes.refKind }
+            : {},
+      },
       bookId: {
         default: null,
         parseHTML: (element: HTMLElement) =>
@@ -371,6 +567,31 @@ const BookRefMention = (Mention as any).extend({
           'data-spine-index': attributes.spineIndex,
         }),
       },
+      pdfStartPage: {
+        default: null,
+        parseHTML: (element: HTMLElement) =>
+          Number(element.getAttribute('data-pdf-start-page') ?? 'NaN'),
+        renderHTML: (attributes: Record<string, any>) => ({
+          'data-pdf-start-page': attributes.pdfStartPage,
+        }),
+      },
+      pdfEndPage: {
+        default: null,
+        parseHTML: (element: HTMLElement) =>
+          Number(element.getAttribute('data-pdf-end-page') ?? 'NaN'),
+        renderHTML: (attributes: Record<string, any>) => ({
+          'data-pdf-end-page': attributes.pdfEndPage,
+        }),
+      },
+      pdfPageLabel: {
+        default: null,
+        parseHTML: (element: HTMLElement) =>
+          element.getAttribute('data-pdf-page-label'),
+        renderHTML: (attributes: Record<string, any>) =>
+          attributes.pdfPageLabel
+            ? { 'data-pdf-page-label': attributes.pdfPageLabel }
+            : {},
+      },
     }
   },
   addNodeView() {
@@ -412,16 +633,33 @@ function BookRefNodeView(props: ReactNodeViewProps) {
   const attrs = (props.node.attrs ?? {}) as BookRefAttrs
   const bookTitle = String(attrs.bookTitle ?? '').trim() || 'Book'
   const titleLabel = `@${bookTitle}` // this is where the book title is displayed for the bookRef chip
+  const refKind = String(attrs.refKind ?? '').trim()
+  const pdfStartPageNum = Number((attrs as any).pdfStartPage)
+  const pdfEndPageNum = Number((attrs as any).pdfEndPage)
+  const isPageRange =
+    refKind === 'page-range' ||
+    Number.isFinite(pdfStartPageNum) ||
+    Number.isFinite(pdfEndPageNum)
   const chapterTitle = String(attrs.chapterTitle ?? '').trim()
-  const isChapter = Boolean(chapterTitle)
+  const isChapter = !isPageRange && Boolean(chapterTitle)
 
   const startPage = Number(attrs.startPage ?? 0)
   const startIndex = Number(attrs.startIndex ?? 0)
   const endPage = Number(attrs.endPage ?? 0)
   const endIndex = Number(attrs.endIndex ?? 0)
-  const locLabel = isChapter
-    ? `(chapter:${chapterTitle})`
-    : `(${startPage}:${startIndex}-${endPage}:${endIndex})`
+  const pdfFallbackLabel =
+    Number.isFinite(pdfStartPageNum) && Number.isFinite(pdfEndPageNum)
+      ? pdfStartPageNum === pdfEndPageNum
+        ? String(pdfStartPageNum + 1)
+        : `${pdfStartPageNum + 1}–${pdfEndPageNum + 1}`
+      : ''
+  const pdfPageLabel =
+    String(attrs.pdfPageLabel ?? '').trim() || pdfFallbackLabel
+  const locLabel = isPageRange
+    ? `(p.${pdfPageLabel || '?'})`
+    : isChapter
+      ? `(chapter:${chapterTitle})`
+      : `(${startPage}:${startIndex}-${endPage}:${endIndex})`
   const label = `${titleLabel}${locLabel}`
   const selectedText = String(attrs.selectedText ?? '')
   const snippet = truncateSnippet(selectedText, 500)
@@ -436,7 +674,11 @@ function BookRefNodeView(props: ReactNodeViewProps) {
   const startIndexNum = Number((attrs as any).startIndex)
   const canNavigateByOffset =
     Number.isFinite(spineIndexNum) && Number.isFinite(startIndexNum)
-  const canNavigate = hasBookId && (hasHref || canNavigateByOffset)
+  const canNavigate =
+    hasBookId &&
+    (hasHref ||
+      canNavigateByOffset ||
+      (isPageRange && Number.isFinite(pdfStartPageNum)))
   const canCopy = Boolean(selectedText.trim())
 
   const handleCopy = async (e: React.MouseEvent) => {
@@ -461,6 +703,8 @@ function BookRefNodeView(props: ReactNodeViewProps) {
         hasBookId,
         href: attrs.href,
         hasHref,
+        refKind: attrs.refKind,
+        pdfStartPage: attrs.pdfStartPage,
         spineIndex: attrs.spineIndex,
         startIndex: attrs.startIndex,
         canNavigateByOffset,
@@ -476,6 +720,13 @@ function BookRefNodeView(props: ReactNodeViewProps) {
     const textOffset = startIndexNum
     const selectedTextForNav =
       selectedText.length > 2000 ? selectedText.slice(0, 2000) : selectedText
+
+    if (isPageRange && Number.isFinite(pdfStartPageNum)) {
+      const pageHref = `page:${Math.max(0, Math.floor(pdfStartPageNum))}`
+      debugChatMentions('chip:navigate:pageRange', { bookId, href: pageHref })
+      onNavigate?.({ bookId, href: pageHref })
+      return
+    }
 
     // Prefer href navigation when we have an explicit fragment; otherwise we'd
     // drop the anchor and jump to the start of the spine item.
@@ -630,7 +881,7 @@ function ChatComposer(props: {
   placeholder: string
   autoFocus?: boolean
   focusRequestId?: string | null
-  pendingInsert?: BookRefInsert | null
+  pendingInsert?: ChatPendingInsert | null
   onConsumePendingInsert?: (id: string) => void
   onModI?: () => void
   onNewChat?: () => void
@@ -638,6 +889,9 @@ function ChatComposer(props: {
   onNavigateBookRef?: (payload: BookRefNavigatePayload) => void
   chapterSuggestions?: Array<ChapterSuggestion>
   currentBook?: CurrentBookInfo | null
+  activeBookFormat?: ReaderFormat
+  pdfVisiblePages?: Array<PdfVisiblePageSuggestion>
+  pdfPageCount?: number | null
   canSubmit: boolean
   isStreaming: boolean
   onStopStreaming: () => void
@@ -655,6 +909,15 @@ function ChatComposer(props: {
   const currentBookRef = React.useRef<CurrentBookInfo | null>(
     props.currentBook ?? null,
   )
+  const activeBookFormatRef = React.useRef<ReaderFormat>(
+    props.activeBookFormat ?? 'epub',
+  )
+  const pdfVisiblePagesRef = React.useRef<Array<PdfVisiblePageSuggestion>>(
+    props.pdfVisiblePages ?? [],
+  )
+  const pdfPageCountRef = React.useRef<number | null>(
+    props.pdfPageCount ?? null,
+  )
   onDocChangeRef.current = props.onDocChange
   onSubmitRef.current = props.onSubmit
   onModIRef.current = props.onModI
@@ -663,6 +926,9 @@ function ChatComposer(props: {
   onNavigateBookRefRef.current = props.onNavigateBookRef
   chapterSuggestionsRef.current = props.chapterSuggestions ?? []
   currentBookRef.current = props.currentBook ?? null
+  activeBookFormatRef.current = props.activeBookFormat ?? 'epub'
+  pdfVisiblePagesRef.current = props.pdfVisiblePages ?? []
+  pdfPageCountRef.current = props.pdfPageCount ?? null
 
   const handleNavigateBookRef = React.useCallback(
     (payload: BookRefNavigatePayload) =>
@@ -705,12 +971,19 @@ function ChatComposer(props: {
           suggestion: {
             char: '@',
             items: ({ query }: any) =>
-              filterChapterSuggestions(chapterSuggestionsRef.current, query),
+              buildMentionSuggestions({
+                chapters: chapterSuggestionsRef.current,
+                query,
+                activeBookFormat: activeBookFormatRef.current,
+                pdfVisiblePages: pdfVisiblePagesRef.current,
+                pdfPageCount: pdfPageCountRef.current,
+              }),
             render: chapterSuggestionRenderer,
             command: ({ editor, range, props: item }: any) => {
               const currentBook = currentBookRef.current
               const bookId = String(currentBook?.bookId ?? '').trim()
               const bookTitle = String(currentBook?.bookTitle ?? '').trim()
+              const kind = String(item?.kind ?? 'chapter')
               const title = String(item?.title ?? '').trim()
               const href = String(item?.href ?? '').trim()
               const spineIndex = Number(item?.spineIndex ?? NaN)
@@ -721,6 +994,47 @@ function ChatComposer(props: {
                   spineIndex,
                   range,
                 })
+                return
+              }
+              if (kind === 'page-range') {
+                const startPage = Number(item?.startPage ?? NaN)
+                const endPage = Number(item?.endPage ?? NaN)
+                const pageLabel = String(item?.pageLabel ?? '').trim()
+                if (
+                  !Number.isFinite(startPage) ||
+                  !Number.isFinite(endPage) ||
+                  !pageLabel
+                ) {
+                  return
+                }
+                debugChatMentions('insert:pageRange', {
+                  bookId,
+                  bookTitle,
+                  startPage,
+                  endPage,
+                  pageLabel,
+                  range,
+                })
+                editor
+                  .chain()
+                  .focus()
+                  .insertContentAt(range, {
+                    type: 'bookRef',
+                    attrs: {
+                      id: createId(),
+                      refKind: 'page-range',
+                      bookId,
+                      bookTitle,
+                      href: `page:${Math.max(0, Math.floor(startPage))}`,
+                      pdfStartPage: Math.max(0, Math.floor(startPage)),
+                      pdfEndPage: Math.max(0, Math.floor(endPage)),
+                      pdfPageLabel: pageLabel,
+                      spineIndex: Math.max(0, Math.floor(startPage)),
+                      startIndex: 0,
+                    },
+                  })
+                  .insertContent(' ')
+                  .run()
                 return
               }
               if (!title || !href || !Number.isFinite(spineIndex)) return
@@ -832,7 +1146,9 @@ function ChatComposer(props: {
     if (!files || files.length === 0) return
 
     const accepted = Array.from(files).filter((f) =>
-      String(f.type ?? '').toLowerCase().startsWith('image/'),
+      String(f.type ?? '')
+        .toLowerCase()
+        .startsWith('image/'),
     )
     if (accepted.length === 0) return
 
@@ -847,11 +1163,8 @@ function ChatComposer(props: {
     for (const file of accepted) {
       try {
         const dataUrl = await readAsDataUrl(file)
-        const match = /^data:([^;]+);base64,(.+)$/i.exec(dataUrl)
-        if (!match) continue
-        const mediaType = match[1] ?? ''
-        const dataBase64 = match[2] ?? ''
-        if (!mediaType || !dataBase64) continue
+        const image = parseDataUrlImage(dataUrl)
+        if (!image?.mediaType || !image.dataBase64) continue
 
         editor
           .chain()
@@ -861,8 +1174,8 @@ function ChatComposer(props: {
             attrs: {
               id: createId(),
               filename: file.name,
-              mediaType,
-              dataBase64,
+              mediaType: image.mediaType,
+              dataBase64: image.dataBase64,
               sizeBytes: file.size,
             } satisfies ChatImageAttrs,
           })
@@ -908,6 +1221,24 @@ function ChatComposer(props: {
             selectedText: pending.selectedText,
             spineIndex: pending.spineIndex,
           },
+        })
+        .insertContent(' ')
+        .run()
+    } else if (pending.kind === 'chatImage') {
+      const chain = editor.chain().focus()
+      if (pending.prefixText?.trim()) {
+        chain.insertContent(pending.prefixText)
+      }
+      chain
+        .insertContent({
+          type: 'chatImage',
+          attrs: {
+            id: pending.id,
+            filename: pending.filename,
+            mediaType: pending.mediaType,
+            dataBase64: pending.dataBase64,
+            sizeBytes: pending.sizeBytes ?? null,
+          } satisfies ChatImageAttrs,
         })
         .insertContent(' ')
         .run()
@@ -1105,7 +1436,7 @@ export function ChatSidePanel(
     onConsumePendingConversationAction?: (id: string) => void
     pendingHistoryToggle?: { id: string } | null
     onConsumePendingHistoryToggle?: (id: string) => void
-    pendingInsert?: BookRefInsert | null
+    pendingInsert?: ChatPendingInsert | null
     onConsumePendingInsert?: (id: string) => void
     onModI?: () => void
     onNewChat?: () => void
@@ -1113,6 +1444,9 @@ export function ChatSidePanel(
     onNavigateBookRef?: (payload: BookRefNavigatePayload) => void
     chapterSuggestions?: Array<ChapterSuggestion>
     currentBook?: CurrentBookInfo | null
+    activeBookFormat?: ReaderFormat
+    pdfVisiblePages?: Array<PdfVisiblePageSuggestion>
+    pdfPageCount?: number | null
     getCurrentReaderPage?: () => CurrentReaderPage | null
     getCurrentReaderPageStable?: (options?: {
       timeoutMs?: number
@@ -1134,6 +1468,13 @@ export function ChatSidePanel(
     }) => Promise<string | null>
     getSpineItemParts?: (options: {
       spineIndex: number
+      maxChars?: number
+      maxImages?: number
+      maxImageBytes?: number
+    }) => Promise<Array<TextPart | ImagePart> | null>
+    getPageRangeParts?: (options: {
+      startPage: number
+      endPage: number
       maxChars?: number
       maxImages?: number
       maxImageBytes?: number
@@ -1163,9 +1504,8 @@ export function ChatSidePanel(
   const [draftDoc, setDraftDoc] = React.useState<TiptapDoc>(() =>
     emptyTiptapDoc(),
   )
-  const [queuedInsert, setQueuedInsert] = React.useState<BookRefInsert | null>(
-    null,
-  )
+  const [queuedInsert, setQueuedInsert] =
+    React.useState<ChatPendingInsert | null>(null)
   const [isStreaming, setIsStreaming] = React.useState(false)
   const [editingMessageId, setEditingMessageId] = React.useState<string | null>(
     null,
@@ -1193,8 +1533,8 @@ export function ChatSidePanel(
   )
 
   const docHasImages = React.useCallback((doc: TiptapDoc) => {
-    return extractChatImagesFromDoc(doc).some(
-      (img) => Boolean(String(img.dataBase64 ?? '').trim()),
+    return extractChatImagesFromDoc(doc).some((img) =>
+      Boolean(String(img.dataBase64 ?? '').trim()),
     )
   }, [])
 
@@ -1215,10 +1555,22 @@ export function ChatSidePanel(
     promptMessages: Array<ChatMessage>,
   ): Promise<ModelMessage | null> => {
     const refs: Array<BookRefAttrs> = []
+    let lastUserMessage: ChatMessage | null = null
     for (const msg of promptMessages) {
       if (msg.role !== 'user') continue
+      lastUserMessage = msg
       const doc = parseTiptapDoc(msg.contentJson ?? null, msg.content)
       refs.push(...extractBookRefsFromDoc(doc))
+    }
+    if (lastUserMessage) {
+      refs.push(
+        ...extractPdfPageRefsFromText(
+          lastUserMessage.content,
+          props.currentBook,
+          props.activeBookFormat,
+          props.pdfPageCount,
+        ),
+      )
     }
     const currentBookId = String(props.currentBook?.bookId ?? '').trim()
     return await buildEpubReferenceMessage({
@@ -1226,6 +1578,7 @@ export function ChatSidePanel(
       currentBookId,
       getSpineItemParts: props.getSpineItemParts,
       getSpineItemText: props.getSpineItemText,
+      getPageRangeParts: props.getPageRangeParts,
     })
   }
 
@@ -1781,11 +2134,7 @@ export function ChatSidePanel(
         (err.name === 'AbortError' || /aborted/i.test(err.message))
 
       if (!wasAborted) {
-        setError(
-          err instanceof Error
-            ? err.message
-            : 'Failed to regenerate a response.',
-        )
+        setError(streamErrorMessage(err, 'Failed to regenerate a response.'))
         setMessages((prev) => prev.filter((m) => m.id !== assistantMessageId))
         setActiveHeadId(newUserMessage.id)
       } else {
@@ -1901,11 +2250,7 @@ export function ChatSidePanel(
         (err.name === 'AbortError' || /aborted/i.test(err.message))
 
       if (!wasAborted) {
-        setError(
-          err instanceof Error
-            ? err.message
-            : 'Failed to regenerate a response.',
-        )
+        setError(streamErrorMessage(err, 'Failed to regenerate a response.'))
         setMessages((prev) => prev.filter((m) => m.id !== newAssistantId))
         setActiveHeadId(parentId)
       } else {
@@ -2140,9 +2485,7 @@ export function ChatSidePanel(
         (err.name === 'AbortError' || /aborted/i.test(err.message))
 
       if (!wasAborted) {
-        setError(
-          err instanceof Error ? err.message : 'Failed to generate a response.',
-        )
+        setError(streamErrorMessage(err, 'Failed to generate a response.'))
         setMessages((prev) => prev.filter((m) => m.id !== assistantMessageId))
         setActiveHeadId(userMessage.id)
       } else {
@@ -2200,17 +2543,19 @@ export function ChatSidePanel(
                   </div>
                 </TooltipContent>
               </Tooltip>
-	              <Tooltip>
-	                <TooltipTrigger asChild>
-	                  <button
-	                    type="button"
-	                    onClick={() => {
-	                      setTab((prev) => (prev === 'history' ? 'chat' : 'history'))
-	                    }}
-	                    className={cn(
-	                      'cursor-pointer p-1.5 rounded-lg transition-colors',
-	                      tab === 'history'
-	                        ? 'bg-[color:var(--paper-deep)]'
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setTab((prev) =>
+                        prev === 'history' ? 'chat' : 'history',
+                      )
+                    }}
+                    className={cn(
+                      'cursor-pointer p-1.5 rounded-lg transition-colors',
+                      tab === 'history'
+                        ? 'bg-[color:var(--paper-deep)]'
                         : 'hover:bg-[color:var(--paper-deep)]',
                     )}
                     aria-pressed={tab === 'history'}
@@ -2335,6 +2680,9 @@ export function ChatSidePanel(
                           onNavigateBookRef={props.onNavigateBookRef}
                           chapterSuggestions={props.chapterSuggestions ?? []}
                           currentBook={props.currentBook ?? null}
+                          activeBookFormat={props.activeBookFormat ?? 'epub'}
+                          pdfVisiblePages={props.pdfVisiblePages ?? []}
+                          pdfPageCount={props.pdfPageCount ?? null}
                           canSubmit={
                             Boolean(editText.trim()) || docHasImages(editDoc)
                           }
@@ -2620,6 +2968,9 @@ export function ChatSidePanel(
           onNavigateBookRef={props.onNavigateBookRef}
           chapterSuggestions={props.chapterSuggestions ?? []}
           currentBook={props.currentBook ?? null}
+          activeBookFormat={props.activeBookFormat ?? 'epub'}
+          pdfVisiblePages={props.pdfVisiblePages ?? []}
+          pdfPageCount={props.pdfPageCount ?? null}
           canSubmit={Boolean(draftText.trim()) || docHasImages(draftDoc)}
           isStreaming={isStreaming}
           onStopStreaming={stopStreaming}
@@ -2630,21 +2981,128 @@ export function ChatSidePanel(
   )
 }
 
-function filterChapterSuggestions(
-  chapters: Array<ChapterSuggestion>,
+function pageRangeLabel(startLabel: string, endLabel: string) {
+  return startLabel === endLabel ? startLabel : `${startLabel}–${endLabel}`
+}
+
+function uniquePageRangeSuggestions(items: Array<PageRangeSuggestion>) {
+  const seen = new Set<string>()
+  return items.filter((item) => {
+    const key = `${item.startPage}:${item.endPage}`
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
+  })
+}
+
+function numericPageSuggestion(
   query: string,
-): Array<ChapterSuggestion> {
+  pageCount: number | null | undefined,
+): PageRangeSuggestion | null {
+  const normalized = String(query ?? '').trim()
+  const match = /^(\d+)(?:\s*-\s*(\d+))?$/.exec(normalized)
+  if (!match) return null
+  const count = Number(pageCount ?? NaN)
+  if (!Number.isFinite(count) || count <= 0) return null
+  const firstInput = Number.parseInt(match[1] ?? '', 10)
+  const lastInput = Number.parseInt(match[2] ?? match[1] ?? '', 10)
+  if (!Number.isFinite(firstInput) || !Number.isFinite(lastInput)) return null
+  const start = Math.max(
+    0,
+    Math.min(count - 1, Math.min(firstInput, lastInput) - 1),
+  )
+  const end = Math.max(
+    0,
+    Math.min(count - 1, Math.max(firstInput, lastInput) - 1),
+  )
+  const label = start === end ? String(start + 1) : `${start + 1}–${end + 1}`
+  return {
+    kind: 'page-range',
+    title: start === end ? `Page ${label}` : `Pages ${label}`,
+    href: `page:${start}`,
+    spineIndex: start,
+    depth: 0,
+    startPage: start,
+    endPage: end,
+    pageLabel: label,
+  }
+}
+
+function buildPdfPageSuggestions(options: {
+  query: string
+  visiblePages: Array<PdfVisiblePageSuggestion>
+  pageCount?: number | null
+}): Array<PageRangeSuggestion> {
+  const visible = options.visiblePages
+    .filter((page) => Number.isFinite(Number(page.pageIndex)))
+    .map((page) => ({
+      pageIndex: Math.max(0, Math.floor(Number(page.pageIndex))),
+      label:
+        String(page.label ?? '').trim() || String(Number(page.pageIndex) + 1),
+    }))
+    .sort((a, b) => a.pageIndex - b.pageIndex)
+
+  const suggestions: Array<PageRangeSuggestion> = []
+  const first = visible[0]
+  if (first) {
+    suggestions.push({
+      kind: 'page-range',
+      title: `Current page (p.${first.label})`,
+      href: `page:${first.pageIndex}`,
+      spineIndex: first.pageIndex,
+      depth: 0,
+      startPage: first.pageIndex,
+      endPage: first.pageIndex,
+      pageLabel: first.label,
+    })
+  }
+
+  if (visible.length === 2) {
+    const second = visible[1]
+    const label = pageRangeLabel(first.label, second.label)
+    suggestions.push({
+      kind: 'page-range',
+      title: `Current spread (p.${label})`,
+      href: `page:${first.pageIndex}`,
+      spineIndex: first.pageIndex,
+      depth: 0,
+      startPage: first.pageIndex,
+      endPage: second.pageIndex,
+      pageLabel: label,
+    })
+  }
+
+  const numeric = numericPageSuggestion(options.query, options.pageCount)
+  if (numeric) suggestions.push(numeric)
+  return uniquePageRangeSuggestions(suggestions)
+}
+
+function buildMentionSuggestions(options: {
+  chapters: Array<ChapterSuggestion>
+  query: string
+  activeBookFormat?: ReaderFormat
+  pdfVisiblePages?: Array<PdfVisiblePageSuggestion>
+  pdfPageCount?: number | null
+}): Array<MentionSuggestion> {
   const normalized = String(query ?? '')
     .trim()
     .toLowerCase()
   const list = normalized
     ? chapters.filter((c) => String(c.title).toLowerCase().includes(normalized))
     : chapters
-  return list.slice(0, 12)
+  const chapterMatches = list.slice(0, 12)
+  if (options.activeBookFormat !== 'pdf') return chapterMatches
+
+  const pdfSuggestions = buildPdfPageSuggestions({
+    query: options.query,
+    visiblePages: options.pdfVisiblePages ?? [],
+    pageCount: options.pdfPageCount,
+  })
+  return [...pdfSuggestions, ...chapterMatches].slice(0, 12)
 }
 
 function ChapterSuggestionMenu(props: {
-  items: Array<ChapterSuggestion>
+  items: Array<MentionSuggestion>
   selectedIndex: number
   onSelect: (index: number) => void
   onHover: (index: number) => void
@@ -2667,7 +3125,7 @@ function ChapterSuggestionMenu(props: {
       onMouseDown={(e) => e.preventDefault()}
     >
       <div className="px-3 py-2 text-[10px] font-semibold text-[color:var(--ink)]/60">
-        Chapters
+        References
       </div>
       <div ref={scrollContainerRef} className="max-h-64 overflow-auto py-1">
         {props.items.map((item, index) => {
@@ -2708,7 +3166,7 @@ function createChapterSuggestionRenderer() {
   let selectedIndex = 0
   let latestFull: any = null
   let latestRect: DOMRect | null = null
-  let latestItems: Array<ChapterSuggestion> = []
+  let latestItems: Array<MentionSuggestion> = []
   let sessionId: number | null = null
 
   const virtualRef = {

@@ -10,6 +10,7 @@ import (
 	"os"
 	"path"
 	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -22,9 +23,10 @@ import (
 )
 
 type R2Client struct {
-	client    *s3.Client
-	bucket    string
-	publicURL string
+	client        *s3.Client
+	bucket        string
+	publicURL     string
+	localEndpoint bool
 }
 
 var ErrObjectNotFound = errors.New("r2 object not found")
@@ -32,6 +34,9 @@ var ErrObjectNotFound = errors.New("r2 object not found")
 type DownloadMeta struct {
 	ContentType   string
 	ContentLength int64
+	AcceptRanges  string
+	ContentRange  string
+	ETag          string
 }
 
 func NewR2Client(ctx context.Context) (*R2Client, error) {
@@ -40,16 +45,27 @@ func NewR2Client(ctx context.Context) (*R2Client, error) {
 	secretAccessKey := os.Getenv("R2_SECRET_ACCESS_KEY")
 	bucket := os.Getenv("R2_BUCKET_NAME")
 	publicURL := os.Getenv("R2_PUBLIC_URL")
+	endpoint := strings.TrimSpace(os.Getenv("S3_ENDPOINT_URL"))
+	region := strings.TrimSpace(os.Getenv("S3_REGION"))
+	forcePathStyle := parseBoolEnv("S3_FORCE_PATH_STYLE")
 
-	if accountID == "" || accessKeyID == "" || secretAccessKey == "" || bucket == "" {
+	if endpoint == "" && accountID == "" {
+		return nil, fmt.Errorf("R2_ACCOUNT_ID or S3_ENDPOINT_URL environment variable is required")
+	}
+	if accessKeyID == "" || secretAccessKey == "" || bucket == "" {
 		return nil, fmt.Errorf("R2 environment variables not set")
 	}
 
-	endpoint := fmt.Sprintf("https://%s.r2.cloudflarestorage.com", accountID)
+	if endpoint == "" {
+		endpoint = fmt.Sprintf("https://%s.r2.cloudflarestorage.com", accountID)
+	}
+	if region == "" {
+		region = "auto"
+	}
 
 	cfg, err := config.LoadDefaultConfig(ctx,
 		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(accessKeyID, secretAccessKey, "")),
-		config.WithRegion("auto"),
+		config.WithRegion(region),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load AWS config: %w", err)
@@ -57,12 +73,17 @@ func NewR2Client(ctx context.Context) (*R2Client, error) {
 
 	client := s3.NewFromConfig(cfg, func(o *s3.Options) {
 		o.BaseEndpoint = aws.String(endpoint)
+		o.UsePathStyle = forcePathStyle
+		if strings.TrimSpace(os.Getenv("S3_ENDPOINT_URL")) != "" {
+			o.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
+		}
 	})
 
 	r2 := &R2Client{
-		client:    client,
-		bucket:    bucket,
-		publicURL: publicURL,
+		client:        client,
+		bucket:        bucket,
+		publicURL:     publicURL,
+		localEndpoint: strings.TrimSpace(os.Getenv("S3_ENDPOINT_URL")) != "",
 	}
 
 	if err := r2.verify(ctx); err != nil {
@@ -147,6 +168,14 @@ func (r *R2Client) UploadReader(
 ) (string, error) {
 	if contentType == "" {
 		contentType = "application/octet-stream"
+	}
+	if r.localEndpoint {
+		data, err := io.ReadAll(body)
+		if err != nil {
+			return "", err
+		}
+		body = bytes.NewReader(data)
+		contentLength = int64(len(data))
 	}
 
 	input := &s3.PutObjectInput{
@@ -269,10 +298,23 @@ func (r *R2Client) Exists(ctx context.Context, key string) (bool, error) {
 }
 
 func (r *R2Client) Download(ctx context.Context, key string) (io.ReadCloser, DownloadMeta, error) {
-	out, err := r.client.GetObject(ctx, &s3.GetObjectInput{
+	return r.download(ctx, key, "")
+}
+
+func (r *R2Client) DownloadRange(ctx context.Context, key string, byteRange string) (io.ReadCloser, DownloadMeta, error) {
+	return r.download(ctx, key, strings.TrimSpace(byteRange))
+}
+
+func (r *R2Client) download(ctx context.Context, key string, byteRange string) (io.ReadCloser, DownloadMeta, error) {
+	input := &s3.GetObjectInput{
 		Bucket: aws.String(r.bucket),
 		Key:    aws.String(key),
-	})
+	}
+	if byteRange != "" {
+		input.Range = aws.String(byteRange)
+	}
+
+	out, err := r.client.GetObject(ctx, input)
 	if err != nil {
 		if isNotFoundErr(err) {
 			return nil, DownloadMeta{}, ErrObjectNotFound
@@ -287,7 +329,37 @@ func (r *R2Client) Download(ctx context.Context, key string) (io.ReadCloser, Dow
 	if out.ContentLength != nil {
 		meta.ContentLength = *out.ContentLength
 	}
+	if out.AcceptRanges != nil {
+		meta.AcceptRanges = *out.AcceptRanges
+	}
+	if out.ContentRange != nil {
+		meta.ContentRange = *out.ContentRange
+	}
+	if out.ETag != nil {
+		meta.ETag = *out.ETag
+	}
 	return out.Body, meta, nil
+}
+
+func (r *R2Client) IsLocalEndpoint() bool {
+	return r.localEndpoint
+}
+
+func (r *R2Client) PresignGet(ctx context.Context, key string, ttl time.Duration) (string, error) {
+	if ttl <= 0 {
+		ttl = 15 * time.Minute
+	}
+	presigner := s3.NewPresignClient(r.client)
+	out, err := presigner.PresignGetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(r.bucket),
+		Key:    aws.String(key),
+	}, func(opts *s3.PresignOptions) {
+		opts.Expires = ttl
+	})
+	if err != nil {
+		return "", err
+	}
+	return out.URL, nil
 }
 
 func (r *R2Client) PublicURL(key string) string {
@@ -313,7 +385,15 @@ func (r *R2Client) KeyFromPublicURL(url string) (string, bool) {
 }
 
 func SourceEPUBKey(bookID uuid.UUID) string {
-	return path.Join("books", bookID.String(), "source.epub")
+	return SourceKey(bookID, "epub")
+}
+
+func SourceKey(bookID uuid.UUID, format string) string {
+	ext := "epub"
+	if strings.EqualFold(strings.TrimSpace(format), "pdf") {
+		ext = "pdf"
+	}
+	return path.Join("books", bookID.String(), "source."+ext)
 }
 
 func BookCoverKey(bookID uuid.UUID) string {
@@ -343,4 +423,13 @@ func isNotFoundErr(err error) bool {
 		return true
 	}
 	return false
+}
+
+func parseBoolEnv(key string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(key))) {
+	case "1", "t", "true", "y", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }

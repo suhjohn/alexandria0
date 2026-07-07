@@ -12,6 +12,10 @@ export function useInfiniteCursorQuery<T>(options: {
   queryKey: unknown[]
   limit: number
   enabled?: boolean
+  refetchInterval?:
+    | number
+    | false
+    | ((query: unknown) => number | false | undefined)
   queryFn: (args: {
     cursor: string | null
     limit: number
@@ -25,6 +29,7 @@ export function useInfiniteCursorQuery<T>(options: {
       options.queryFn({ cursor: pageParam, limit: options.limit }),
     getNextPageParam: (lastPage) => lastPage.next_cursor ?? undefined,
     placeholderData: (prev) => prev,
+    refetchInterval: options.refetchInterval,
   })
 
   const items = useMemo(

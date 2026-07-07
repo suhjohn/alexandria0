@@ -12,7 +12,7 @@ import { Route as rootRouteImport } from './routes/__root'
 import { Route as LoginRouteImport } from './routes/login'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as TestReaderRouteImport } from './routes/test/reader'
-import { Route as BooksBookIdRouteImport } from './routes/books/$bookId'
+import { Route as TestPdfreaderRouteImport } from './routes/test/pdfreader'
 
 const LoginRoute = LoginRouteImport.update({
   id: '/login',
@@ -29,43 +29,43 @@ const TestReaderRoute = TestReaderRouteImport.update({
   path: '/test/reader',
   getParentRoute: () => rootRouteImport,
 } as any)
-const BooksBookIdRoute = BooksBookIdRouteImport.update({
-  id: '/books/$bookId',
-  path: '/books/$bookId',
+const TestPdfreaderRoute = TestPdfreaderRouteImport.update({
+  id: '/test/pdfreader',
+  path: '/test/pdfreader',
   getParentRoute: () => rootRouteImport,
 } as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/login': typeof LoginRoute
-  '/books/$bookId': typeof BooksBookIdRoute
+  '/test/pdfreader': typeof TestPdfreaderRoute
   '/test/reader': typeof TestReaderRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/login': typeof LoginRoute
-  '/books/$bookId': typeof BooksBookIdRoute
+  '/test/pdfreader': typeof TestPdfreaderRoute
   '/test/reader': typeof TestReaderRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
   '/login': typeof LoginRoute
-  '/books/$bookId': typeof BooksBookIdRoute
+  '/test/pdfreader': typeof TestPdfreaderRoute
   '/test/reader': typeof TestReaderRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/' | '/login' | '/books/$bookId' | '/test/reader'
+  fullPaths: '/' | '/login' | '/test/pdfreader' | '/test/reader'
   fileRoutesByTo: FileRoutesByTo
-  to: '/' | '/login' | '/books/$bookId' | '/test/reader'
-  id: '__root__' | '/' | '/login' | '/books/$bookId' | '/test/reader'
+  to: '/' | '/login' | '/test/pdfreader' | '/test/reader'
+  id: '__root__' | '/' | '/login' | '/test/pdfreader' | '/test/reader'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   LoginRoute: typeof LoginRoute
-  BooksBookIdRoute: typeof BooksBookIdRoute
+  TestPdfreaderRoute: typeof TestPdfreaderRoute
   TestReaderRoute: typeof TestReaderRoute
 }
 
@@ -92,11 +92,11 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof TestReaderRouteImport
       parentRoute: typeof rootRouteImport
     }
-    '/books/$bookId': {
-      id: '/books/$bookId'
-      path: '/books/$bookId'
-      fullPath: '/books/$bookId'
-      preLoaderRoute: typeof BooksBookIdRouteImport
+    '/test/pdfreader': {
+      id: '/test/pdfreader'
+      path: '/test/pdfreader'
+      fullPath: '/test/pdfreader'
+      preLoaderRoute: typeof TestPdfreaderRouteImport
       parentRoute: typeof rootRouteImport
     }
   }
@@ -105,7 +105,7 @@ declare module '@tanstack/react-router' {
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   LoginRoute: LoginRoute,
-  BooksBookIdRoute: BooksBookIdRoute,
+  TestPdfreaderRoute: TestPdfreaderRoute,
   TestReaderRoute: TestReaderRoute,
 }
 export const routeTree = rootRouteImport

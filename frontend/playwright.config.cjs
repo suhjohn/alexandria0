@@ -46,7 +46,7 @@ module.exports = defineConfig({
   webServer: {
     // Run E2E against a production build by default.
     // Enable test-only routes via `VITE_E2E=1` (kept out of real prod builds).
-    command: `VITE_E2E=1 VITE_API_URL=${apiUrl} pnpm build && pnpm preview --port 3000 --strictPort`,
+    command: `VITE_E2E=1 VITE_API_URL=${apiUrl} pnpm build && VITE_E2E=1 VITE_API_URL=${apiUrl} pnpm preview --port 3000 --strictPort`,
     url: appUrl,
     reuseExistingServer: !process.env.CI,
     timeout: 180_000,

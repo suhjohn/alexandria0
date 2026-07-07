@@ -53,6 +53,8 @@ var (
 )
 
 func init() {
+	cobra.OnInitialize(loadEnv)
+
 	syncGutenbergCmd.Flags().IntVarP(&syncCount, "count", "n", 10, "Number of books to sync")
 	syncGutenbergCmd.Flags().Bool("skip-existing", false, "Skip books that already exist")
 	serveCmd.Flags().StringVarP(&serverPort, "port", "p", "8080", "Port to run the server on")
@@ -76,8 +78,6 @@ func init() {
 }
 
 func main() {
-	loadEnv()
-
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
@@ -115,6 +115,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 
 	bookRepo := models.NewBookRepository(database.Pool)
 	jobRepo := models.NewTransformJobRepository(database.Pool)
+	classificationJobRepo := models.NewClassificationJobRepository(database.Pool)
 	userRepo := models.NewUserRepository(database.Pool)
 	tokenRepo := models.NewMagicLinkTokenRepository(database.Pool)
 	sessionRepo := models.NewSessionRepository(database.Pool)
@@ -125,13 +126,20 @@ func runServe(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to create R2 client: %w", err)
 	}
 
-	booksHandler := handlers.NewBooksHandler(bookRepo, authService, r2Client)
+	booksHandler := handlers.NewBooksHandler(bookRepo, classificationJobRepo, authService, r2Client)
 
 	transformHandler := handlers.NewBookTransformHandler(
 		bookRepo,
 		jobRepo,
 		r2Client,
 		authService,
+		os.Getenv("TRANSFORM_API_URL"),
+		os.Getenv("TRANSFORM_API_SECRET_KEY"),
+	)
+	classificationWorker := handlers.NewClassificationWorker(
+		bookRepo,
+		classificationJobRepo,
+		r2Client,
 		os.Getenv("TRANSFORM_API_URL"),
 		os.Getenv("TRANSFORM_API_SECRET_KEY"),
 	)
@@ -153,7 +161,8 @@ func runServe(cmd *cobra.Command, args []string) error {
 				w.Header().Set("Vary", "Origin")
 			}
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, Range, X-Requested-With")
+			w.Header().Set("Access-Control-Expose-Headers", "Accept-Ranges, Content-Length, Content-Range, Content-Type, ETag, Location")
 			if r.Method == "OPTIONS" {
 				w.WriteHeader(http.StatusOK)
 				return
@@ -187,6 +196,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	}
 
 	go transformHandler.StartWorker(ctx, 20*time.Second)
+	go classificationWorker.StartWorker(ctx, 15*time.Second)
 
 	// Graceful shutdown
 	go func() {

@@ -3,8 +3,8 @@ package handlers
 import (
 	"archive/zip"
 	"bytes"
-	"encoding/xml"
 	"encoding/json"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
@@ -13,6 +13,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -22,15 +23,22 @@ import (
 )
 
 type BooksHandler struct {
-	repo *models.BookRepository
-	auth CurrentUserProvider
-	r2   *storage.R2Client
+	repo                  *models.BookRepository
+	classificationJobRepo *models.ClassificationJobRepository
+	auth                  CurrentUserProvider
+	r2                    *storage.R2Client
 }
 
 var errPersonalQuotaExceeded = errors.New("personal upload quota exceeded")
+var errUploadTooLarge = errors.New("upload too large")
 
-func NewBooksHandler(repo *models.BookRepository, auth CurrentUserProvider, r2 *storage.R2Client) *BooksHandler {
-	return &BooksHandler{repo: repo, auth: auth, r2: r2}
+func NewBooksHandler(
+	repo *models.BookRepository,
+	classificationJobRepo *models.ClassificationJobRepository,
+	auth CurrentUserProvider,
+	r2 *storage.R2Client,
+) *BooksHandler {
+	return &BooksHandler{repo: repo, classificationJobRepo: classificationJobRepo, auth: auth, r2: r2}
 }
 
 func (h *BooksHandler) GetThumbnail(w http.ResponseWriter, r *http.Request) {
@@ -77,6 +85,10 @@ func (h *BooksHandler) GetThumbnail(w http.ResponseWriter, r *http.Request) {
 			// older uploads created before thumbnail extraction existed).
 			book, bookErr := h.repo.GetByID(r.Context(), bookID)
 			if bookErr != nil || book == nil {
+				respondError(w, r, "Thumbnail not found", http.StatusNotFound, err)
+				return
+			}
+			if strings.EqualFold(book.Format, "pdf") {
 				respondError(w, r, "Thumbnail not found", http.StatusNotFound, err)
 				return
 			}
@@ -393,6 +405,19 @@ func (h *BooksHandler) GetFile(w http.ResponseWriter, r *http.Request) {
 		respondError(w, r, "Failed to resolve book file", http.StatusBadRequest, err)
 		return
 	}
+	if strings.HasSuffix(strings.ToLower(key), ".pdf") {
+		if h.r2.IsLocalEndpoint() {
+			h.serveFile(w, r, key)
+			return
+		}
+		url, err := h.r2.PresignGet(r.Context(), key, 15*time.Minute)
+		if err != nil {
+			respondError(w, r, "Failed to create file URL", http.StatusBadGateway, err)
+			return
+		}
+		http.Redirect(w, r, url, http.StatusFound)
+		return
+	}
 
 	rc, meta, err := h.r2.Download(r.Context(), key)
 	if err != nil {
@@ -423,6 +448,50 @@ func (h *BooksHandler) GetFile(w http.ResponseWriter, r *http.Request) {
 	_, _ = io.Copy(w, rc)
 }
 
+func (h *BooksHandler) serveFile(w http.ResponseWriter, r *http.Request, key string) {
+	byteRange := strings.TrimSpace(r.Header.Get("Range"))
+	rc, meta, err := h.r2.DownloadRange(r.Context(), key, byteRange)
+	if err != nil {
+		if errors.Is(err, storage.ErrObjectNotFound) {
+			respondError(w, r, "Book file not found", http.StatusNotFound, err)
+			return
+		}
+		respondError(w, r, "Failed to fetch book file", http.StatusBadGateway, err)
+		return
+	}
+	defer rc.Close()
+
+	w.Header().Set("Cache-Control", "private, max-age=0, no-store")
+	if meta.ContentType != "" {
+		w.Header().Set("Content-Type", meta.ContentType)
+	} else {
+		w.Header().Set("Content-Type", "application/octet-stream")
+	}
+	if meta.ContentLength > 0 {
+		w.Header().Set("Content-Length", strconv.FormatInt(meta.ContentLength, 10))
+	}
+	if meta.AcceptRanges != "" {
+		w.Header().Set("Accept-Ranges", meta.AcceptRanges)
+	}
+	if meta.ContentRange != "" {
+		w.Header().Set("Content-Range", meta.ContentRange)
+	}
+	if meta.ETag != "" {
+		w.Header().Set("ETag", meta.ETag)
+	}
+	filename := path.Base(key)
+	if filename != "" {
+		w.Header().Set("Content-Disposition", `inline; filename="`+filename+`"`)
+	}
+
+	if byteRange != "" && meta.ContentRange != "" {
+		w.WriteHeader(http.StatusPartialContent)
+	} else {
+		w.WriteHeader(http.StatusOK)
+	}
+	_, _ = io.Copy(w, rc)
+}
+
 func (h *BooksHandler) Upload(w http.ResponseWriter, r *http.Request) {
 	if h.auth == nil {
 		respondError(w, r, "Unauthorized", http.StatusUnauthorized, nil)
@@ -443,14 +512,15 @@ func (h *BooksHandler) Upload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	const maxUploadBytes = int64(50 << 20) // 50MB
-	const maxMemoryBytes = int64(10 << 20) // 10MB
+	const maxEPUBUploadBytes = int64(50 << 20)      // 50MB
+	const maxPDFUploadBytes = int64(200 << 20)      // 200MB
+	const maxMemoryBytes = int64(10 << 20)          // 10MB
 	const maxPersonalLibraryBytes = int64(10) << 30 // 10GiB
-	r.Body = http.MaxBytesReader(w, r.Body, maxUploadBytes)
+	r.Body = http.MaxBytesReader(w, r.Body, maxPDFUploadBytes)
 	if err := r.ParseMultipartForm(maxMemoryBytes); err != nil {
 		var maxErr *http.MaxBytesError
 		if errors.As(err, &maxErr) || strings.Contains(err.Error(), "request body too large") {
-			respondError(w, r, "Upload too large (max 50MB)", http.StatusRequestEntityTooLarge, err)
+			respondError(w, r, "Upload too large (max 200MB)", http.StatusRequestEntityTooLarge, err)
 			return
 		}
 		respondError(w, r, "Invalid upload payload", http.StatusBadRequest, err)
@@ -469,12 +539,21 @@ func (h *BooksHandler) Upload(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 
-	if header != nil && header.Size > 0 && header.Size > maxUploadBytes {
-		respondError(w, r, "Upload too large (max 50MB)", http.StatusRequestEntityTooLarge, nil)
+	format, err := sniffUploadFormat(file, header)
+	if err != nil {
+		respondError(w, r, err.Error(), http.StatusBadRequest, err)
 		return
 	}
-	if err := validateEPUBUpload(file, header); err != nil {
-		respondError(w, r, err.Error(), http.StatusBadRequest, err)
+	maxUploadBytes := maxEPUBUploadBytes
+	maxUploadMessage := "Upload too large (max 50MB)"
+	contentType := "application/epub+zip"
+	if format == "pdf" {
+		maxUploadBytes = maxPDFUploadBytes
+		maxUploadMessage = "Upload too large (max 200MB)"
+		contentType = "application/pdf"
+	}
+	if header != nil && header.Size > 0 && header.Size > maxUploadBytes {
+		respondError(w, r, maxUploadMessage, http.StatusRequestEntityTooLarge, nil)
 		return
 	}
 
@@ -494,16 +573,21 @@ func (h *BooksHandler) Upload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	bookID := uuid.New()
-	destKey := storage.SourceEPUBKey(bookID)
+	destKey := storage.SourceKey(bookID, format)
 	contentLength := int64(0)
 	if header != nil && header.Size > 0 {
 		contentLength = header.Size
 	}
-	reader := &quotaReader{r: io.LimitReader(file, maxUploadBytes), maxBytes: remainingBytes}
-	_, err = h.r2.UploadReader(r.Context(), reader, destKey, "application/epub+zip", contentLength)
+	sizeReader := &uploadLimitReader{r: file, maxBytes: maxUploadBytes}
+	reader := &quotaReader{r: sizeReader, maxBytes: remainingBytes}
+	_, err = h.r2.UploadReader(r.Context(), reader, destKey, contentType, contentLength)
 	if err != nil {
 		if errors.Is(err, errPersonalQuotaExceeded) {
 			respondError(w, r, "Personal library storage limit reached (10GB)", http.StatusRequestEntityTooLarge, err)
+			return
+		}
+		if errors.Is(err, errUploadTooLarge) {
+			respondError(w, r, maxUploadMessage, http.StatusRequestEntityTooLarge, err)
 			return
 		}
 		respondError(w, r, "Failed to store upload", http.StatusBadGateway, err)
@@ -521,7 +605,9 @@ func (h *BooksHandler) Upload(w http.ResponseWriter, r *http.Request) {
 	if contentLengthForCover <= 0 {
 		contentLengthForCover = sourceSizeBytes
 	}
-	coverBytes, coverContentType = extractCoverImageFromEPUBFile(file, contentLengthForCover)
+	if format == "epub" {
+		coverBytes, coverContentType = extractCoverImageFromEPUBFile(file, contentLengthForCover)
+	}
 
 	title := strings.TrimSpace(r.FormValue("title"))
 	if title == "" {
@@ -539,6 +625,7 @@ func (h *BooksHandler) Upload(w http.ResponseWriter, r *http.Request) {
 		ThumbnailURL:       "",
 		TransformationData: map[string][]string{},
 		SourceSizeBytes:    sourceSizeBytes,
+		Format:             format,
 		Visibility:         "private",
 		OwnerUserID:        &user.ID,
 	}
@@ -554,6 +641,14 @@ func (h *BooksHandler) Upload(w http.ResponseWriter, r *http.Request) {
 		_ = h.r2.Delete(r.Context(), destKey)
 		respondError(w, r, "Failed to create book", http.StatusInternalServerError, err)
 		return
+	}
+	if format == "pdf" && h.classificationJobRepo != nil {
+		if _, err := h.classificationJobRepo.Upsert(r.Context(), bookID, "pending", ""); err != nil {
+			_, _ = h.repo.DeleteOwned(r.Context(), bookID, user.ID)
+			_, _ = h.r2.DeletePrefix(r.Context(), fmt.Sprintf("books/%s/", bookID.String()))
+			respondError(w, r, "Failed to create classification job", http.StatusInternalServerError, err)
+			return
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -851,28 +946,70 @@ func resolveR2Key(raw string, r2 *storage.R2Client) (string, error) {
 	return value, nil
 }
 
-func validateEPUBUpload(file multipart.File, header *multipart.FileHeader) error {
+func sniffUploadFormat(file multipart.File, header *multipart.FileHeader) (string, error) {
 	if header == nil {
-		return errors.New("Missing file metadata")
+		return "", errors.New("Missing file metadata")
 	}
-	filename := strings.TrimSpace(header.Filename)
-	if filename != "" && strings.ToLower(path.Ext(filename)) != ".epub" {
-		return errors.New("Only .epub files are supported")
+	if file == nil {
+		return "", errors.New("Missing file")
 	}
 
-	// EPUBs are ZIP containers; sniff the first few bytes.
-	head := make([]byte, 4)
-	n, err := io.ReadFull(file, head)
-	if err != nil || n < 4 {
-		return errors.New("Invalid EPUB")
+	filename := strings.TrimSpace(header.Filename)
+	ext := strings.ToLower(path.Ext(filename))
+	if ext != ".epub" && ext != ".pdf" {
+		return "", errors.New("Only .epub and .pdf files are supported")
 	}
+
+	head := make([]byte, 1024)
+	n, readErr := file.Read(head)
 	if _, err := file.Seek(0, io.SeekStart); err != nil {
-		return errors.New("Failed to read upload")
+		return "", errors.New("Failed to read upload")
 	}
-	if head[0] != 'P' || head[1] != 'K' {
-		return errors.New("Invalid EPUB (expected a ZIP container)")
+	if readErr != nil && !errors.Is(readErr, io.EOF) {
+		return "", errors.New("Failed to read upload")
 	}
-	return nil
+
+	if ext == ".epub" {
+		if n < 2 || head[0] != 'P' || head[1] != 'K' {
+			return "", errors.New("Invalid EPUB (expected a ZIP container)")
+		}
+		return "epub", nil
+	}
+
+	if !bytes.Contains(head[:n], []byte("%PDF-")) {
+		return "", errors.New("Invalid PDF")
+	}
+	return "pdf", nil
+}
+
+type uploadLimitReader struct {
+	r         io.Reader
+	maxBytes  int64
+	bytesRead int64
+}
+
+func (u *uploadLimitReader) Read(p []byte) (int, error) {
+	if u.maxBytes >= 0 {
+		remaining := u.maxBytes - u.bytesRead
+		if remaining <= 0 {
+			var one [1]byte
+			n, err := u.r.Read(one[:])
+			if n > 0 {
+				return 0, errUploadTooLarge
+			}
+			if err != nil {
+				return 0, err
+			}
+			return 0, io.EOF
+		}
+		if int64(len(p)) > remaining {
+			p = p[:remaining]
+		}
+	}
+
+	n, err := u.r.Read(p)
+	u.bytesRead += int64(n)
+	return n, err
 }
 
 type quotaReader struct {

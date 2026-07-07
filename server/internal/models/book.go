@@ -3,6 +3,7 @@ package models
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -18,10 +19,19 @@ type Book struct {
 	ThumbnailURL       string              `json:"thumbnail_url"`
 	TransformationData map[string][]string `json:"transformation_data"`
 	SourceSizeBytes    int64               `json:"source_size_bytes"`
+	Format             string              `json:"format"`
+	PdfHasTextLayer    *bool               `json:"pdf_has_text_layer"`
+	PageCount          *int                `json:"page_count"`
 	Visibility         string              `json:"visibility"`
 	OwnerUserID        *uuid.UUID          `json:"owner_user_id"`
 	CreatedAt          time.Time           `json:"created_at"`
 	UpdatedAt          time.Time           `json:"updated_at"`
+}
+
+const bookColumns = "id, url, title, authors, thumbnail_url, transformation_data, source_size_bytes, format, pdf_has_text_layer, page_count, visibility, owner_user_id, created_at, updated_at"
+
+type bookScanner interface {
+	Scan(dest ...any) error
 }
 
 type BookRepository struct {
@@ -30,6 +40,38 @@ type BookRepository struct {
 
 func NewBookRepository(pool *pgxpool.Pool) *BookRepository {
 	return &BookRepository{pool: pool}
+}
+
+func scanBook(scanner bookScanner) (Book, error) {
+	var book Book
+	var transformationDataJSON []byte
+
+	err := scanner.Scan(
+		&book.ID,
+		&book.URL,
+		&book.Title,
+		&book.Authors,
+		&book.ThumbnailURL,
+		&transformationDataJSON,
+		&book.SourceSizeBytes,
+		&book.Format,
+		&book.PdfHasTextLayer,
+		&book.PageCount,
+		&book.Visibility,
+		&book.OwnerUserID,
+		&book.CreatedAt,
+		&book.UpdatedAt,
+	)
+	if err != nil {
+		return book, err
+	}
+	if err := json.Unmarshal(transformationDataJSON, &book.TransformationData); err != nil {
+		book.TransformationData = make(map[string][]string)
+	}
+	if book.Format == "" {
+		book.Format = "epub"
+	}
+	return book, nil
 }
 
 type BookCursor struct {
@@ -46,7 +88,7 @@ type BookSearchResult struct {
 
 func (r *BookRepository) GetAll(ctx context.Context) ([]Book, error) {
 	rows, err := r.pool.Query(ctx, `
-		SELECT id, url, title, authors, thumbnail_url, transformation_data, source_size_bytes, visibility, owner_user_id, created_at, updated_at
+		SELECT `+bookColumns+`
 		FROM books
 		ORDER BY created_at DESC
 	`)
@@ -57,28 +99,9 @@ func (r *BookRepository) GetAll(ctx context.Context) ([]Book, error) {
 
 	var books []Book
 	for rows.Next() {
-		var book Book
-		var transformationDataJSON []byte
-
-		err := rows.Scan(
-			&book.ID,
-			&book.URL,
-			&book.Title,
-			&book.Authors,
-			&book.ThumbnailURL,
-			&transformationDataJSON,
-			&book.SourceSizeBytes,
-			&book.Visibility,
-			&book.OwnerUserID,
-			&book.CreatedAt,
-			&book.UpdatedAt,
-		)
+		book, err := scanBook(rows)
 		if err != nil {
 			return nil, err
-		}
-
-		if err := json.Unmarshal(transformationDataJSON, &book.TransformationData); err != nil {
-			book.TransformationData = make(map[string][]string)
 		}
 
 		books = append(books, book)
@@ -126,7 +149,7 @@ func (r *BookRepository) SearchPublic(ctx context.Context, query string, limit i
 	rows, err := r.pool.Query(ctx, `
 		WITH ranked AS (
 			SELECT
-				id, url, title, authors, thumbnail_url, transformation_data, source_size_bytes, visibility, owner_user_id, created_at, updated_at,
+				`+bookColumns+`,
 				CASE
 					WHEN $1 = '' THEN 0
 					ELSE GREATEST(
@@ -145,7 +168,7 @@ func (r *BookRepository) SearchPublic(ctx context.Context, query string, limit i
 				)
 		)
 		SELECT
-			id, url, title, authors, thumbnail_url, transformation_data, source_size_bytes, visibility, owner_user_id, created_at, updated_at, rank
+			`+bookColumns+`, rank
 		FROM ranked
 		WHERE ($3::bool = false) OR ((rank, created_at, id) < ($4, $5, $6))
 		ORDER BY rank DESC, created_at DESC, id DESC
@@ -159,9 +182,9 @@ func (r *BookRepository) SearchPublic(ctx context.Context, query string, limit i
 	var books []Book
 	var nextCursor *BookCursor
 	for rows.Next() {
+		var rank float64
 		var book Book
 		var transformationDataJSON []byte
-		var rank float64
 		err := rows.Scan(
 			&book.ID,
 			&book.URL,
@@ -170,6 +193,9 @@ func (r *BookRepository) SearchPublic(ctx context.Context, query string, limit i
 			&book.ThumbnailURL,
 			&transformationDataJSON,
 			&book.SourceSizeBytes,
+			&book.Format,
+			&book.PdfHasTextLayer,
+			&book.PageCount,
 			&book.Visibility,
 			&book.OwnerUserID,
 			&book.CreatedAt,
@@ -182,6 +208,9 @@ func (r *BookRepository) SearchPublic(ctx context.Context, query string, limit i
 
 		if err := json.Unmarshal(transformationDataJSON, &book.TransformationData); err != nil {
 			book.TransformationData = make(map[string][]string)
+		}
+		if book.Format == "" {
+			book.Format = "epub"
 		}
 
 		books = append(books, book)
@@ -259,7 +288,7 @@ func (r *BookRepository) SearchPersonal(
 		WITH ranked AS (
 			SELECT
 				b.id, b.url, b.title, b.authors, b.thumbnail_url, b.transformation_data, b.source_size_bytes,
-				b.visibility, b.owner_user_id, b.created_at, b.updated_at,
+				b.format, b.pdf_has_text_layer, b.page_count, b.visibility, b.owner_user_id, b.created_at, b.updated_at,
 				CASE
 					WHEN $3 = '' THEN 0
 					ELSE GREATEST(
@@ -279,7 +308,7 @@ func (r *BookRepository) SearchPersonal(
 				)
 		)
 		SELECT
-			id, url, title, authors, thumbnail_url, transformation_data, source_size_bytes, visibility, owner_user_id, created_at, updated_at, rank
+			`+bookColumns+`, rank
 		FROM ranked
 		WHERE ($4::bool = false) OR ((rank, created_at, id) < ($5, $6, $7))
 		ORDER BY rank DESC, created_at DESC, id DESC
@@ -293,9 +322,9 @@ func (r *BookRepository) SearchPersonal(
 	var books []Book
 	var nextCursor *BookCursor
 	for rows.Next() {
+		var rank float64
 		var book Book
 		var transformationDataJSON []byte
-		var rank float64
 		err := rows.Scan(
 			&book.ID,
 			&book.URL,
@@ -304,6 +333,9 @@ func (r *BookRepository) SearchPersonal(
 			&book.ThumbnailURL,
 			&transformationDataJSON,
 			&book.SourceSizeBytes,
+			&book.Format,
+			&book.PdfHasTextLayer,
+			&book.PageCount,
 			&book.Visibility,
 			&book.OwnerUserID,
 			&book.CreatedAt,
@@ -316,6 +348,9 @@ func (r *BookRepository) SearchPersonal(
 
 		if err := json.Unmarshal(transformationDataJSON, &book.TransformationData); err != nil {
 			book.TransformationData = make(map[string][]string)
+		}
+		if book.Format == "" {
+			book.Format = "epub"
 		}
 
 		books = append(books, book)
@@ -346,7 +381,7 @@ func (r *BookRepository) SearchPersonal(
 
 func (r *BookRepository) GetAllPublic(ctx context.Context) ([]Book, error) {
 	rows, err := r.pool.Query(ctx, `
-		SELECT id, url, title, authors, thumbnail_url, transformation_data, source_size_bytes, visibility, owner_user_id, created_at, updated_at
+		SELECT `+bookColumns+`
 		FROM books
 		WHERE visibility = 'public'
 		ORDER BY created_at DESC
@@ -358,28 +393,9 @@ func (r *BookRepository) GetAllPublic(ctx context.Context) ([]Book, error) {
 
 	var books []Book
 	for rows.Next() {
-		var book Book
-		var transformationDataJSON []byte
-
-		err := rows.Scan(
-			&book.ID,
-			&book.URL,
-			&book.Title,
-			&book.Authors,
-			&book.ThumbnailURL,
-			&transformationDataJSON,
-			&book.SourceSizeBytes,
-			&book.Visibility,
-			&book.OwnerUserID,
-			&book.CreatedAt,
-			&book.UpdatedAt,
-		)
+		book, err := scanBook(rows)
 		if err != nil {
 			return nil, err
-		}
-
-		if err := json.Unmarshal(transformationDataJSON, &book.TransformationData); err != nil {
-			book.TransformationData = make(map[string][]string)
 		}
 
 		books = append(books, book)
@@ -392,7 +408,7 @@ func (r *BookRepository) GetAllForUser(ctx context.Context, userID uuid.UUID, em
 	normalized := NormalizeEmail(email)
 	rows, err := r.pool.Query(ctx, `
 		SELECT DISTINCT b.id, b.url, b.title, b.authors, b.thumbnail_url, b.transformation_data, b.source_size_bytes,
-		       b.visibility, b.owner_user_id, b.created_at, b.updated_at
+		       b.format, b.pdf_has_text_layer, b.page_count, b.visibility, b.owner_user_id, b.created_at, b.updated_at
 		FROM books b
 		LEFT JOIN book_shares bs ON bs.book_id = b.id AND bs.email = $2
 		WHERE b.visibility = 'public'
@@ -407,28 +423,9 @@ func (r *BookRepository) GetAllForUser(ctx context.Context, userID uuid.UUID, em
 
 	var books []Book
 	for rows.Next() {
-		var book Book
-		var transformationDataJSON []byte
-
-		err := rows.Scan(
-			&book.ID,
-			&book.URL,
-			&book.Title,
-			&book.Authors,
-			&book.ThumbnailURL,
-			&transformationDataJSON,
-			&book.SourceSizeBytes,
-			&book.Visibility,
-			&book.OwnerUserID,
-			&book.CreatedAt,
-			&book.UpdatedAt,
-		)
+		book, err := scanBook(rows)
 		if err != nil {
 			return nil, err
-		}
-
-		if err := json.Unmarshal(transformationDataJSON, &book.TransformationData); err != nil {
-			book.TransformationData = make(map[string][]string)
 		}
 
 		books = append(books, book)
@@ -478,35 +475,16 @@ func (r *BookRepository) HasAccess(ctx context.Context, bookID uuid.UUID, userID
 }
 
 func (r *BookRepository) GetByID(ctx context.Context, id uuid.UUID) (*Book, error) {
-	var book Book
-	var transformationDataJSON []byte
-
-	err := r.pool.QueryRow(ctx, `
-		SELECT id, url, title, authors, thumbnail_url, transformation_data, source_size_bytes, visibility, owner_user_id, created_at, updated_at
+	book, err := scanBook(r.pool.QueryRow(ctx, `
+		SELECT `+bookColumns+`
 		FROM books
 		WHERE id = $1
-	`, id).Scan(
-		&book.ID,
-		&book.URL,
-		&book.Title,
-		&book.Authors,
-		&book.ThumbnailURL,
-		&transformationDataJSON,
-		&book.SourceSizeBytes,
-		&book.Visibility,
-		&book.OwnerUserID,
-		&book.CreatedAt,
-		&book.UpdatedAt,
-	)
+	`, id))
 	if err != nil {
 		if err == pgx.ErrNoRows {
 			return nil, nil
 		}
 		return nil, err
-	}
-
-	if err := json.Unmarshal(transformationDataJSON, &book.TransformationData); err != nil {
-		book.TransformationData = make(map[string][]string)
 	}
 
 	return &book, nil
@@ -539,6 +517,9 @@ func (r *BookRepository) Create(ctx context.Context, book *Book) error {
 	if book.SourceSizeBytes < 0 {
 		book.SourceSizeBytes = 0
 	}
+	if book.Format == "" {
+		book.Format = "epub"
+	}
 
 	transformationDataJSON, err := json.Marshal(book.TransformationData)
 	if err != nil {
@@ -546,9 +527,9 @@ func (r *BookRepository) Create(ctx context.Context, book *Book) error {
 	}
 
 	_, err = r.pool.Exec(ctx, `
-		INSERT INTO books (id, url, title, authors, thumbnail_url, transformation_data, source_size_bytes, visibility, owner_user_id)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-	`, book.ID, book.URL, book.Title, book.Authors, book.ThumbnailURL, transformationDataJSON, book.SourceSizeBytes, book.Visibility, book.OwnerUserID)
+		INSERT INTO books (id, url, title, authors, thumbnail_url, transformation_data, source_size_bytes, format, pdf_has_text_layer, page_count, visibility, owner_user_id)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+	`, book.ID, book.URL, book.Title, book.Authors, book.ThumbnailURL, transformationDataJSON, book.SourceSizeBytes, book.Format, book.PdfHasTextLayer, book.PageCount, book.Visibility, book.OwnerUserID)
 
 	return err
 }
@@ -606,6 +587,9 @@ func (r *BookRepository) Upsert(ctx context.Context, book *Book) error {
 	if book.SourceSizeBytes < 0 {
 		book.SourceSizeBytes = 0
 	}
+	if book.Format == "" {
+		book.Format = "epub"
+	}
 
 	transformationDataJSON, err := json.Marshal(book.TransformationData)
 	if err != nil {
@@ -613,8 +597,8 @@ func (r *BookRepository) Upsert(ctx context.Context, book *Book) error {
 	}
 
 	_, err = r.pool.Exec(ctx, `
-		INSERT INTO books (id, url, title, authors, thumbnail_url, transformation_data, source_size_bytes, visibility, owner_user_id)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		INSERT INTO books (id, url, title, authors, thumbnail_url, transformation_data, source_size_bytes, format, pdf_has_text_layer, page_count, visibility, owner_user_id)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 		ON CONFLICT (id) DO UPDATE
 		SET url = EXCLUDED.url,
 			title = EXCLUDED.title,
@@ -622,10 +606,46 @@ func (r *BookRepository) Upsert(ctx context.Context, book *Book) error {
 			thumbnail_url = EXCLUDED.thumbnail_url,
 			transformation_data = EXCLUDED.transformation_data,
 			source_size_bytes = EXCLUDED.source_size_bytes,
+			format = EXCLUDED.format,
+			pdf_has_text_layer = EXCLUDED.pdf_has_text_layer,
+			page_count = EXCLUDED.page_count,
 			visibility = EXCLUDED.visibility,
 			owner_user_id = EXCLUDED.owner_user_id,
 			updated_at = NOW()
-	`, book.ID, book.URL, book.Title, book.Authors, book.ThumbnailURL, transformationDataJSON, book.SourceSizeBytes, book.Visibility, book.OwnerUserID)
+	`, book.ID, book.URL, book.Title, book.Authors, book.ThumbnailURL, transformationDataJSON, book.SourceSizeBytes, book.Format, book.PdfHasTextLayer, book.PageCount, book.Visibility, book.OwnerUserID)
+	return err
+}
+
+func (r *BookRepository) SetClassification(
+	ctx context.Context,
+	bookID uuid.UUID,
+	hasTextLayer bool,
+	pageCount int,
+	title string,
+	author string,
+) error {
+	title = strings.TrimSpace(title)
+	author = strings.TrimSpace(author)
+
+	_, err := r.pool.Exec(ctx, `
+		UPDATE books
+		SET pdf_has_text_layer = $2,
+			page_count = $3,
+			title = CASE WHEN $4 <> '' THEN $4 ELSE title END,
+			authors = CASE WHEN $5 <> '' AND cardinality(authors) = 0 THEN ARRAY[$5]::TEXT[] ELSE authors END,
+			updated_at = NOW()
+		WHERE id = $1
+	`, bookID, hasTextLayer, pageCount, title, author)
+	return err
+}
+
+func (r *BookRepository) SetThumbnailURL(ctx context.Context, bookID uuid.UUID, thumbnailURL string) error {
+	_, err := r.pool.Exec(ctx, `
+		UPDATE books
+		SET thumbnail_url = $2,
+			updated_at = NOW()
+		WHERE id = $1
+	`, bookID, thumbnailURL)
 	return err
 }
 

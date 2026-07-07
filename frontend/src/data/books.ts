@@ -7,6 +7,9 @@ export interface Book {
   authors: string[]
   thumbnail_url: string
   transformation_data: Record<string, string[]>
+  format: 'epub' | 'pdf'
+  pdf_has_text_layer: boolean | null
+  page_count: number | null
   visibility?: string
   owner_user_id?: string | null
 }
@@ -34,6 +37,21 @@ const defaultApiUrl = 'http://localhost:8080'
 
 function apiBase() {
   return import.meta.env.VITE_API_URL || defaultApiUrl
+}
+
+async function transformErrorMessage(
+  response: Response,
+  fallback: string,
+): Promise<string> {
+  try {
+    const payload = await response.clone().json()
+    const message = String(payload?.error ?? payload?.message ?? '').trim()
+    if (message) return message
+  } catch {
+    // fall through to text response
+  }
+  const text = (await response.text().catch(() => '')).trim()
+  return text || fallback
 }
 
 export function getBookFileUrl(
@@ -122,10 +140,13 @@ export async function uploadBook(options: {
 }
 
 export async function deleteBook(bookId: string): Promise<void> {
-  const response = await fetch(`${apiBase()}/books/${encodeURIComponent(bookId)}`, {
-    method: 'DELETE',
-    credentials: 'include',
-  })
+  const response = await fetch(
+    `${apiBase()}/books/${encodeURIComponent(bookId)}`,
+    {
+      method: 'DELETE',
+      credentials: 'include',
+    },
+  )
 
   if (response.status === 204 || response.status === 404) return
 
@@ -161,7 +182,9 @@ export const startBookTransform = async (
   })
 
   if (!response.ok) {
-    throw new Error('Failed to start transform')
+    throw new Error(
+      await transformErrorMessage(response, 'Failed to start transform'),
+    )
   }
 
   return response.json()
@@ -183,7 +206,9 @@ export const getBookTransform = async (
   )
 
   if (!response.ok) {
-    throw new Error('Failed to fetch transform status')
+    throw new Error(
+      await transformErrorMessage(response, 'Failed to fetch transform status'),
+    )
   }
 
   return response.json()
