@@ -21,7 +21,7 @@ import type {
   EpubReaderV2ThemePreset,
   EpubReaderV2VisiblePage,
 } from './types'
-import { IoCheckmarkCircle, IoSparkles } from 'react-icons/io5'
+import { IoCheckmarkCircle, IoColorPalette, IoSparkles } from 'react-icons/io5'
 import { Loader2 } from 'lucide-react'
 import { EpubReaderV2Error, THEME_PRESETS } from './types'
 import { fetchArrayBufferWithProgress } from './epub/fetcher'
@@ -44,19 +44,34 @@ import {
 } from './utils/path'
 import { isEpubCfiHref } from './utils/url'
 import { EpubResourceStore } from './rendering/resources'
-import { setReaderSettings, useReaderSettings } from '@/lib/reader-settings'
+import {
+  ContextMenu,
+  ContextMenuContent,
+  ContextMenuItem,
+  ContextMenuSeparator,
+  ContextMenuShortcut,
+  ContextMenuSub,
+  ContextMenuSubContent,
+  ContextMenuSubTrigger,
+  ContextMenuTrigger,
+} from '@/components/ui/context-menu'
 import {
   getBookTransform,
   startBookTransform,
   type TransformStatus,
 } from '@/data/books'
 import {
-  ContextMenu,
-  ContextMenuContent,
-  ContextMenuItem,
-  ContextMenuShortcut,
-  ContextMenuTrigger,
-} from '@/components/ui/context-menu'
+  ALL_HIGHLIGHT_COLORS,
+  HIGHLIGHT_COLORS,
+  HIGHLIGHT_COLOR_LABELS,
+  addAnnotation,
+  clearHighlightsInDocument,
+  getAnnotationsForSpine,
+  removeAnnotation,
+  renderHighlightsInDocument,
+  updateAnnotation,
+} from '@/lib/annotations-store'
+import { setReaderSettings, useReaderSettings } from '@/lib/reader-settings'
 
 export type EpubReaderV2Handle = {
   next: () => void
@@ -1998,7 +2013,11 @@ const EpubReaderV2Inner = forwardRef<
   const [versionsOpen, setVersionsOpen] = useState(false)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [customizeOpen, setCustomizeOpen] = useState(false)
+  const [annotationsOpen, setAnnotationsOpen] = useState(false)
   const [hudActive, setHudActive] = useState(false)
+  const [editingAnnotation, setEditingAnnotation] = useState<string | null>(null)
+  const [editingNote, setEditingNote] = useState('')
+  const [annotationRevision, setAnnotationRevision] = useState(0)
   const [fontSizeChangeCount, setFontSizeChangeCount] = useState(0)
   const [translateLangDraft, setTranslateLangDraft] = useState('')
   const [translateLangError, setTranslateLangError] = useState<string | null>(
@@ -2100,7 +2119,7 @@ const EpubReaderV2Inner = forwardRef<
   const layoutRestoreRetryCountRef = useRef(0)
 
   panelsOpenRef.current =
-    tocOpen || versionsOpen || settingsOpen || customizeOpen
+    tocOpen || versionsOpen || settingsOpen || customizeOpen || annotationsOpen
 
   const hideHudLater = useCallback(() => {
     if (hudHideTimerRef.current) window.clearTimeout(hudHideTimerRef.current)
@@ -3243,6 +3262,20 @@ const EpubReaderV2Inner = forwardRef<
     loadedChapterTokenRef.current = requestedChapterTokenRef.current
   }, [spineIndex])
 
+  // Render highlights after iframe loads or annotations change
+  useEffect(() => {
+    const doc = iframeDocRef.current
+    if (!doc) return
+    const bookId = baseStorageId
+    if (!bookId) return
+
+    clearHighlightsInDocument(doc)
+    const annotations = getAnnotationsForSpine(bookId, spineIndex)
+    if (annotations.length > 0) {
+      renderHighlightsInDocument(doc, annotations)
+    }
+  }, [iframeLoadCount, spineIndex, baseStorageId, annotationRevision])
+
   useEffect(() => {
     const doc = iframeDocRef.current
     if (!doc) return
@@ -4106,6 +4139,7 @@ const EpubReaderV2Inner = forwardRef<
         setVersionsOpen(false)
         setSettingsOpen(false)
         setCustomizeOpen(false)
+        setAnnotationsOpen(false)
         setHudActive(false)
       }
     }
@@ -4486,6 +4520,7 @@ const EpubReaderV2Inner = forwardRef<
         setVersionsOpen(false)
         setSettingsOpen(false)
         setCustomizeOpen(false)
+        setAnnotationsOpen(false)
         setHudActive(false)
       }
     },
@@ -4688,6 +4723,44 @@ const EpubReaderV2Inner = forwardRef<
             Add to chat
             <ContextMenuShortcut>{modIShortcut}</ContextMenuShortcut>
           </ContextMenuItem>
+          <ContextMenuSeparator />
+          <ContextMenuSub>
+            <ContextMenuSubTrigger disabled={!contextMenuSelectionText.trim()}>
+              Highlight
+            </ContextMenuSubTrigger>
+            <ContextMenuSubContent>
+              {ALL_HIGHLIGHT_COLORS.map((color) => (
+                <ContextMenuItem
+                  key={color}
+                  onSelect={() => {
+                    const text = contextMenuSelectionText.trim()
+                    if (!text || !baseStorageId) return
+                    addAnnotation(baseStorageId, {
+                      spineIndex,
+                      selectedText: text,
+                      color,
+                    })
+                    setAnnotationRevision((r) => r + 1)
+                    showToast(`Highlighted in ${color}`)
+                  }}
+                >
+                  <span
+                    style={{
+                      display: 'inline-block',
+                      width: 14,
+                      height: 14,
+                      borderRadius: '50%',
+                      background: HIGHLIGHT_COLORS[color],
+                      border: '1px solid rgba(128,128,128,0.3)',
+                      marginRight: 8,
+                      flexShrink: 0,
+                    }}
+                  />
+                  {HIGHLIGHT_COLOR_LABELS[color]}
+                </ContextMenuItem>
+              ))}
+            </ContextMenuSubContent>
+          </ContextMenuSub>
         </ContextMenuContent>
       </ContextMenu>
       <style>{`
@@ -4947,6 +5020,168 @@ const EpubReaderV2Inner = forwardRef<
           width: 100%;
           background: ${panelBorder};
           margin: 10px 0;
+        }
+
+        /* Annotations Panel */
+        .mfv2-reader__annotationsPanel {
+          position: absolute;
+          top: 56px;
+          left: 16px;
+          width: 360px;
+          max-height: calc(100% - 120px);
+          z-index: 13;
+          background: ${panelBg};
+          backdrop-filter: blur(20px);
+          -webkit-backdrop-filter: blur(20px);
+          border: 1px solid ${panelBorder};
+          border-radius: 16px;
+          padding: 12px;
+          pointer-events: auto;
+          box-shadow: 0 12px 40px rgba(0,0,0,0.3);
+          display: flex;
+          flex-direction: column;
+        }
+        .mfv2-reader__annotationsPanel::before {
+          content: '';
+          position: absolute;
+          top: -8px;
+          left: 52px;
+          width: 16px;
+          height: 16px;
+          background: ${panelBg};
+          border: 1px solid ${panelBorder};
+          border-bottom: none;
+          border-right: none;
+          transform: rotate(45deg);
+        }
+        .mfv2-reader__annotationsHeader {
+          display: flex;
+          align-items: baseline;
+          justify-content: space-between;
+          gap: 12px;
+          padding: 4px 8px 10px 8px;
+        }
+        .mfv2-reader__annotationsTitle {
+          font-size: 13px;
+          font-weight: 600;
+          color: ${isDark ? 'rgba(255,255,255,0.9)' : 'rgba(0,0,0,0.8)'};
+        }
+        .mfv2-reader__annotationsList {
+          overflow-y: auto;
+          flex: 1;
+          min-height: 0;
+        }
+        .mfv2-reader__annotationsEmpty {
+          padding: 20px 8px;
+          text-align: center;
+          font-size: 13px;
+          color: ${isDark ? 'rgba(255,255,255,0.4)' : 'rgba(0,0,0,0.35)'};
+          line-height: 1.5;
+        }
+        .mfv2-reader__annotationItem {
+          padding: 10px 8px;
+          border-bottom: 1px solid ${panelBorder};
+        }
+        .mfv2-reader__annotationItem:last-child {
+          border-bottom: none;
+        }
+        .mfv2-reader__annotationContent {
+          display: flex;
+          gap: 8px;
+          align-items: flex-start;
+        }
+        .mfv2-reader__annotationDot {
+          width: 10px;
+          height: 10px;
+          border-radius: 50%;
+          flex-shrink: 0;
+          margin-top: 4px;
+          border: 1px solid rgba(128,128,128,0.2);
+        }
+        .mfv2-reader__annotationText {
+          font-size: 13px;
+          line-height: 1.5;
+          color: ${isDark ? 'rgba(255,255,255,0.75)' : 'rgba(0,0,0,0.7)'};
+          word-break: break-word;
+        }
+        .mfv2-reader__annotationNote {
+          margin-top: 6px;
+          padding-left: 18px;
+          font-size: 12px;
+          font-style: italic;
+          color: ${isDark ? 'rgba(255,255,255,0.5)' : 'rgba(0,0,0,0.45)'};
+          line-height: 1.4;
+        }
+        .mfv2-reader__annotationActions {
+          margin-top: 8px;
+          padding-left: 18px;
+          display: flex;
+          flex-direction: column;
+          gap: 6px;
+        }
+        .mfv2-reader__annotationColorPicker {
+          display: flex;
+          gap: 6px;
+        }
+        .mfv2-reader__annotationColorBtn {
+          width: 20px;
+          height: 20px;
+          border-radius: 50%;
+          border: 2px solid transparent;
+          cursor: pointer;
+          transition: border-color 150ms ease, transform 150ms ease;
+          padding: 0;
+          appearance: none;
+        }
+        .mfv2-reader__annotationColorBtn:hover {
+          transform: scale(1.15);
+        }
+        .mfv2-reader__annotationColorBtn.is-active {
+          border-color: ${fg};
+        }
+        .mfv2-reader__annotationBtnGroup {
+          display: flex;
+          gap: 8px;
+        }
+        .mfv2-reader__annotationActionBtn {
+          appearance: none;
+          border: none;
+          background: transparent;
+          color: ${isDark ? 'rgba(255,255,255,0.5)' : 'rgba(0,0,0,0.45)'};
+          font-size: 12px;
+          cursor: pointer;
+          padding: 2px 0;
+          transition: color 150ms ease;
+        }
+        .mfv2-reader__annotationActionBtn:hover {
+          color: ${fg};
+        }
+        .mfv2-reader__annotationActionBtn.is-danger:hover {
+          color: #ef4444;
+        }
+        .mfv2-reader__annotationEditRow {
+          margin-top: 8px;
+          padding-left: 18px;
+          display: flex;
+          flex-direction: column;
+          gap: 6px;
+        }
+        .mfv2-reader__annotationNoteInput {
+          width: 100%;
+          padding: 6px 8px;
+          font-size: 13px;
+          background: ${isDark ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.05)'};
+          border: 1px solid ${panelBorder};
+          border-radius: 8px;
+          color: ${fg};
+          outline: none;
+        }
+        .mfv2-reader__annotationNoteInput:focus {
+          border-color: ${isDark ? 'rgba(255,255,255,0.3)' : 'rgba(0,0,0,0.2)'};
+        }
+        .mfv2-reader__annotationEditActions {
+          display: flex;
+          gap: 8px;
         }
         .mfv2-reader__translateRow {
           display: flex;
@@ -5542,10 +5777,23 @@ const EpubReaderV2Inner = forwardRef<
               onClick={() => {
                 setTocOpen((v) => !v)
                 setVersionsOpen(false)
+                setAnnotationsOpen(false)
               }}
               type="button"
             >
               <IoList className="w-4 h-4" />
+            </button>
+            <button
+              className={`mfv2-reader__iconBtn ${annotationsOpen ? 'is-active' : ''}`}
+              onClick={() => {
+                setAnnotationsOpen((v) => !v)
+                setTocOpen(false)
+                setVersionsOpen(false)
+              }}
+              type="button"
+              title="Annotations"
+            >
+              <IoColorPalette className="w-4 h-4" />
             </button>
           </div>
           <div className="mfv2-reader__title" title={chromeTitle}>
@@ -5569,7 +5817,7 @@ const EpubReaderV2Inner = forwardRef<
           </div>
         </div>
 
-        {(tocOpen || versionsOpen || settingsOpen) && !customizeOpen && (
+        {(tocOpen || versionsOpen || settingsOpen || annotationsOpen) && !customizeOpen && (
           <div
             className="mfv2-reader__panelBackdrop"
             aria-hidden="true"
@@ -5577,6 +5825,7 @@ const EpubReaderV2Inner = forwardRef<
               setTocOpen(false)
               setVersionsOpen(false)
               setSettingsOpen(false)
+              setAnnotationsOpen(false)
             }}
           />
         )}
@@ -5795,6 +6044,146 @@ const EpubReaderV2Inner = forwardRef<
             currentHref={currentHref}
             onSelectHref={handleTocSelect}
           />
+        )}
+
+        {/* Annotations Panel */}
+        {annotationsOpen && (
+          <div
+            className="mfv2-reader__annotationsPanel"
+            role="dialog"
+            aria-label="Annotations"
+          >
+            <div className="mfv2-reader__annotationsHeader">
+              <div className="mfv2-reader__annotationsTitle">Highlights</div>
+            </div>
+            <div className="mfv2-reader__annotationsList">
+              {(() => {
+                const allAnnotations = baseStorageId
+                  ? getAnnotationsForSpine(baseStorageId, spineIndex)
+                  : []
+                if (allAnnotations.length === 0) {
+                  return (
+                    <div className="mfv2-reader__annotationsEmpty">
+                      No highlights on this page. Select text and right-click to highlight.
+                    </div>
+                  )
+                }
+                return allAnnotations.map((ann) => (
+                  <div key={ann.id} className="mfv2-reader__annotationItem">
+                    <div className="mfv2-reader__annotationContent">
+                      <span
+                        className="mfv2-reader__annotationDot"
+                        style={{ background: HIGHLIGHT_COLORS[ann.color] }}
+                      />
+                      <div className="mfv2-reader__annotationText">
+                        {ann.selectedText.length > 120
+                          ? ann.selectedText.slice(0, 120) + '...'
+                          : ann.selectedText}
+                      </div>
+                    </div>
+                    {editingAnnotation === ann.id ? (
+                      <div className="mfv2-reader__annotationEditRow">
+                        <input
+                          className="mfv2-reader__annotationNoteInput"
+                          type="text"
+                          placeholder="Add a note..."
+                          value={editingNote}
+                          onChange={(e) => setEditingNote(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter') {
+                              if (baseStorageId) {
+                                updateAnnotation(baseStorageId, ann.id, { note: editingNote })
+                                setAnnotationRevision((r) => r + 1)
+                              }
+                              setEditingAnnotation(null)
+                            }
+                            if (e.key === 'Escape') {
+                              setEditingAnnotation(null)
+                            }
+                          }}
+                          autoFocus
+                        />
+                        <div className="mfv2-reader__annotationEditActions">
+                          <button
+                            type="button"
+                            className="mfv2-reader__annotationActionBtn"
+                            onClick={() => {
+                              if (baseStorageId) {
+                                updateAnnotation(baseStorageId, ann.id, { note: editingNote })
+                                setAnnotationRevision((r) => r + 1)
+                              }
+                              setEditingAnnotation(null)
+                            }}
+                          >
+                            Save
+                          </button>
+                          <button
+                            type="button"
+                            className="mfv2-reader__annotationActionBtn"
+                            onClick={() => setEditingAnnotation(null)}
+                          >
+                            Cancel
+                          </button>
+                        </div>
+                      </div>
+                    ) : (
+                      <>
+                        {ann.note && (
+                          <div className="mfv2-reader__annotationNote">
+                            {ann.note}
+                          </div>
+                        )}
+                        <div className="mfv2-reader__annotationActions">
+                          <div className="mfv2-reader__annotationColorPicker">
+                            {ALL_HIGHLIGHT_COLORS.map((c) => (
+                              <button
+                                key={c}
+                                type="button"
+                                className={`mfv2-reader__annotationColorBtn ${ann.color === c ? 'is-active' : ''}`}
+                                style={{ background: HIGHLIGHT_COLORS[c] }}
+                                onClick={() => {
+                                  if (baseStorageId) {
+                                    updateAnnotation(baseStorageId, ann.id, { color: c })
+                                    setAnnotationRevision((r) => r + 1)
+                                  }
+                                }}
+                                title={HIGHLIGHT_COLOR_LABELS[c]}
+                              />
+                            ))}
+                          </div>
+                          <div className="mfv2-reader__annotationBtnGroup">
+                            <button
+                              type="button"
+                              className="mfv2-reader__annotationActionBtn"
+                              onClick={() => {
+                                setEditingAnnotation(ann.id)
+                                setEditingNote(ann.note ?? '')
+                              }}
+                            >
+                              {ann.note ? 'Edit note' : 'Add note'}
+                            </button>
+                            <button
+                              type="button"
+                              className="mfv2-reader__annotationActionBtn is-danger"
+                              onClick={() => {
+                                if (baseStorageId) {
+                                  removeAnnotation(baseStorageId, ann.id)
+                                  setAnnotationRevision((r) => r + 1)
+                                  showToast('Highlight removed')
+                                }
+                              }}
+                            >
+                              Delete
+                            </button>
+                          </div>
+                        </div>
+                      </>
+                    )}
+                  </div>
+                ))
+              })()}
+            </div>
+          </div>
         )}
 
         {/* Settings Panel - Apple Books Style */}
